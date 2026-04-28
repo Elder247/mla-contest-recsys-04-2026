@@ -1,5 +1,28 @@
-TODO.md
+# данные и веса (большие файлы)
 /data/
+artifacts/*.pt
+artifacts/*.pkl
+artifacts/*.cbm
 
+# окружение
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
 
+# Hydra outputs
+outputs/
+multirun/
 
+# jupyter checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+
+# локальные заметки
+docs/TODO.md
+docs/roadmap.md
