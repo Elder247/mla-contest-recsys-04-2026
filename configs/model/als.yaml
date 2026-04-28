@@ -1,0 +1,8 @@
+_target_: src.models.als.ALSModel
+name: als
+factors: 128
+iterations: 20
+regularization: 0.01
+alpha: 40.0
+n_cand: 500
+random_state: 42

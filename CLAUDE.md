@@ -35,15 +35,21 @@ uid,item_ids
 
 ## Структура репо
 ```
-configs/          Hydra конфиги (data/, model/, split/, features/, experiment/)
+configs/
+  data/           50m.yaml  500m.yaml
+  model/          pop.yaml ✅  user_pop.yaml ✅  als.yaml ✅
+  split/          temporal.yaml
+  train.yaml      evaluate.yaml  submit.yaml  ranker.yaml ✅
 src/
-  data/           dataset.py ✅  splits.py ✅  preprocessing.py  features.py
-  models/         base.py  als.py  lightfm.py  sasrec.py  gru4rec.py  catboost_ranker.py
-  evaluation/     metrics.py ✅   (recall_at_k)
-  inference/      merge_candidates.py
-  training/       trainer.py
-  utils/
-scripts/          train.py  evaluate.py  make_submission.py  download_data.py
+  data/           dataset.py ✅  splits.py ✅  preprocessing.py ✅  features.py (stub)
+  models/         base.py ✅  pop.py ✅  als.py ✅  catboost_ranker.py ✅
+                  lightfm.py (stub)  sasrec.py (stub)  gru4rec.py (stub)
+  evaluation/     metrics.py ✅  (recall_at_k)
+  inference/      merge_candidates.py (stub)
+  training/       trainer.py (stub)
+  utils/          logging.py ✅
+scripts/          train.py ✅  evaluate.py ✅  make_submission.py ✅
+                  train_ranker.py ✅  download_data.py ✅
 notebooks/        00_baseline.ipynb  01_eda.ipynb
 docs/             roadmap.md  dataset-description.md  data-dictionary.md  experiment-log.md
 submissions/      sub_XXX_name.csv  users.csv
@@ -53,11 +59,31 @@ data/             (gitignored) 50m/  500m/  5b/  embeddings.parquet
 
 ## Команды
 ```bash
+# Данные
 python scripts/download_data.py dataset_size=50m
+
+# Одиночная модель (кандидат-генератор)
 python scripts/train.py model=als data=50m
 python scripts/evaluate.py model=als data=50m
-python scripts/make_submission.py model=als data=50m
+python scripts/make_submission.py model=als data=50m run_id=001
+
+# Полный пайплайн ALS → CatBoost Ranker (основной)
+python scripts/train_ranker.py data=50m run_id=002
+
+# Тесты
 pytest tests/ -v
+```
+
+## Запуск долгих команд (обучение)
+Все долгие bash-команды (train, evaluate, make_submission) запускать в фоне с логом в файл:
+```bash
+python scripts/train_ranker.py data=50m 2>&1 | tee /tmp/train.log
+```
+Использовать `run_in_background=true` в Bash-инструменте.
+
+**Пользователю:** чтобы следить за прогрессом в реальном времени, открой терминал и выполни:
+```bash
+tail -f /tmp/train.log
 ```
 
 ## Стиль кода
@@ -83,14 +109,18 @@ return (
 ## MUST
 - Каждый скрипт — `@hydra.main` с конфигом из `configs/`
 - Все гиперпараметры — в YAML, никогда хардкод; `seed: 42` в конфиге
-- Новая модель → новый YAML в `configs/model/` + реализует интерфейс `BaseModel`
-- После каждой новой модели → запустить цикл train/evaluate/submit, записать в `docs/experiment-log.md`
+- Новый кандидат-генератор → YAML в `configs/model/` + класс реализует `BaseModel`
+- Новый pipeline-скрипт (несколько моделей) → отдельный YAML в `configs/` (напр. `configs/ranker.yaml`)
+- После каждого запуска → записать val + test скор в `docs/experiment-log.md`
 
 ## NEVER
 - НЕ трогать `data/` напрямую — только через `src/data/dataset.py`
 - НЕ использовать `print()` — только `logging`
-- НЕ коммитить данные, веса моделей, `docs/roadmap.md`, `docs/TODO.md`
+- НЕ коммитить данные и веса моделей (они в `.gitignore`)
 - НЕ менять валидационный сплит между экспериментами
+
+## Known limitations
+- **Cold users**: ALS не знает юзеров без positive listens в train (~793/10k eval-юзеров). Они получают 0 предсказаний и тянут Recall вниз. Следующий шаг — добавить DecayPop fallback в `train_ranker.py` для cold users.
 
 ## Внешние референсы
 - https://github.com/antklen/recsys_challenge_2025

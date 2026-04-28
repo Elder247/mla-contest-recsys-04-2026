@@ -1,0 +1,30 @@
+defaults:
+  - data: 50m
+  - split: temporal
+  - _self_
+
+seed: 42
+top_k: 100
+output_dir: artifacts
+submission_dir: submissions
+run_id: "002"
+
+als:
+  factors: 128
+  iterations: 20
+  regularization: 0.01
+  alpha: 40.0
+  n_cand: 500
+  random_state: 42
+
+ranker:
+  iterations: 500
+  depth: 6
+  learning_rate: 0.1
+  early_stopping_rounds: 50
+  random_state: 42
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

@@ -1,3 +1,9 @@
 run_id,model,dataset_size,split,score,config_path
 20260428_143916,pop,50m,val,58.0252,configs/model/pop.yaml
 20260428_143916,pop,50m,test,57.1888,configs/model/pop.yaml
+20260428_162439,als,50m,val,22.9696,configs/model/als.yaml
+20260428_162439,als,50m,test,22.6403,configs/model/als.yaml
+20260428_163359,als_ranker,50m,val,24.5457,configs/ranker.yaml
+20260428_174305,als_ranker,50m,val,24.5457,configs/ranker.yaml
+20260428_175222,als_ranker,50m,val,24.5457,configs/ranker.yaml
+20260428_175222,als_ranker,50m,test,24.139,configs/ranker.yaml
