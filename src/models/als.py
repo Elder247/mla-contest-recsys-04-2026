@@ -79,7 +79,7 @@ class ALSModel(BaseModel):
             userid=idxs,
             user_items=self._matrix[idxs],
             N=n,
-            filter_already_liked_items=True,
+            filter_already_liked_items=False,
         )
 
         uids = np.repeat(known, n)

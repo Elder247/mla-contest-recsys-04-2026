@@ -7,3 +7,5 @@ run_id,model,dataset_size,split,score,config_path
 20260428_174305,als_ranker,50m,val,24.5457,configs/ranker.yaml
 20260428_175222,als_ranker,50m,val,24.5457,configs/ranker.yaml
 20260428_175222,als_ranker,50m,test,24.139,configs/ranker.yaml
+20260428_215956,als_ranker,50m,val,132.1202,configs/ranker.yaml
+20260428_215956,als_ranker,50m,test,130.8419,configs/ranker.yaml
