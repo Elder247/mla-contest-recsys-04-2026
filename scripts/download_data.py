@@ -55,7 +55,7 @@ def main(cfg: DictConfig) -> None:
         _download(url, dest)
 
     for fname in COMMON_FILES:
-        url = f"{HF_BASE}/flat/{fname}"
+        url = f"{HF_BASE}/{fname}"  # common files are at repo root, not /flat/
         dest = data_root / fname
         _download(url, dest)
 

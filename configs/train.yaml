@@ -6,3 +6,8 @@ defaults:
 
 seed: 42
 output_dir: artifacts
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

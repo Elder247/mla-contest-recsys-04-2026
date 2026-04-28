@@ -1,0 +1,4 @@
+_target_: src.models.pop.UserPersonalPop
+name: user_pop
+half_life_units: 86400
+candidates_pool: 500

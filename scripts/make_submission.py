@@ -1,4 +1,7 @@
-"""Generate a submission CSV from a trained model.
+"""Generate a submission CSV from a model trained on ALL available data.
+
+Trains from scratch on all positive listens (no temporal split), matching the
+notebook baseline approach. This gives the best possible submission score.
 
 Output format:
     uid,item_ids
@@ -8,7 +11,6 @@ Usage:
     python scripts/make_submission.py model=pop data=50m run_id=001
 """
 import logging
-import pickle
 from pathlib import Path
 
 import hydra
@@ -33,18 +35,17 @@ def _load_users(users_csv: str) -> list[int]:
 def _format_submission(preds: pl.DataFrame, top_k: int) -> pl.DataFrame:
     """Convert uid/item_id/score DataFrame to submission format."""
     if "score" in preds.columns:
-        preds = preds.sort("score", descending=True)
+        preds = preds.sort(["uid", "score"], descending=[False, True])
 
     return (
         preds
         .group_by("uid")
         .head(top_k)
-        .sort(["uid", "score"] if "score" in preds.columns else ["uid"])
         .group_by("uid")
         .agg(
             pl.col("item_id")
             .cast(pl.Utf8)
-            .str.concat(delimiter=" ")
+            .str.join(delimiter=" ")
             .alias("item_ids")
         )
         .sort("uid")
@@ -56,11 +57,15 @@ def main(cfg: DictConfig) -> None:
     setup_logging()
     log.info("config:\n%s", OmegaConf.to_yaml(cfg))
 
-    model_name = cfg.model.get("name", "model")
-    artifact_path = Path(cfg.output_dir) / f"{model_name}_{cfg.data.size}.pkl"
-    log.info("loading model from %s", artifact_path)
-    with open(artifact_path, "rb") as f:
-        model = pickle.load(f)
+    # Train on ALL data — matches notebook, gives best submission score
+    log.info("loading all positive listens from %s", cfg.data.size)
+    listens = positive_listens(load_listens(path=cfg.data.listens))
+    log.info("total positive listens: %d", len(listens))
+
+    model = hydra.utils.instantiate(cfg.model)
+    model_name: str = cfg.model.get("name", type(model).__name__.lower())
+    log.info("training %s on full dataset", model_name)
+    model.fit(listens)
 
     eval_users = _load_users(cfg.data.users_csv)
     log.info("generating recommendations for %d users", len(eval_users))
@@ -70,16 +75,21 @@ def main(cfg: DictConfig) -> None:
     submission = _format_submission(preds, top_k=cfg.top_k)
     log.info("submission rows: %d", len(submission))
 
-    # Validate format
     missing = set(eval_users) - set(submission["uid"].cast(pl.Int64).to_list())
     if missing:
         log.warning("%d users have no predictions", len(missing))
 
+    sub_dir = Path(cfg.submission_dir)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+
     run_id = str(cfg.run_id)
-    out_path = Path(cfg.submission_dir) / f"sub_{run_id}_{model_name}.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    submission.write_csv(out_path)
-    log.info("submission saved to %s", out_path)
+    archive_path = sub_dir / f"sub_{run_id}_{model_name}.csv"
+    submission.write_csv(archive_path)
+    log.info("submission saved to %s", archive_path)
+
+    test_path = sub_dir / "test.csv"
+    submission.write_csv(test_path)
+    log.info("test.csv updated → %s", test_path)
 
 
 if __name__ == "__main__":

@@ -7,3 +7,8 @@ seed: 42
 top_k: 100
 submission_dir: submissions
 run_id: ???
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

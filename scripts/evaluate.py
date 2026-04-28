@@ -65,7 +65,7 @@ def main(cfg: DictConfig) -> None:
         model = pickle.load(f)
 
     # Load data
-    listens = positive_listens(load_listens(cfg.data.size))
+    listens = positive_listens(load_listens(path=cfg.data.listens))
     split = temporal_split(
         listens,
         val_days=cfg.split.val_days,
@@ -92,8 +92,7 @@ def main(cfg: DictConfig) -> None:
             "model": model_name,
             "dataset_size": cfg.data.size,
             "split": split_name,
-            "val_score": score if split_name == "val" else "",
-            "test_score": score if split_name == "test" else "",
+            "score": round(score, 4),
             "config_path": f"configs/model/{model_name}.yaml",
         })
 

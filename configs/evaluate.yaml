@@ -10,3 +10,8 @@ splits:
   - val
   - test
 output_dir: artifacts
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

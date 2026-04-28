@@ -26,7 +26,7 @@ def main(cfg: DictConfig) -> None:
 
     # Load and filter to positive listens
     log.info("loading listens from %s", cfg.data.listens)
-    listens = load_listens(cfg.data.size)
+    listens = load_listens(path=cfg.data.listens)
     listens = positive_listens(listens)
     log.info("positive listens: %d rows", len(listens))
 

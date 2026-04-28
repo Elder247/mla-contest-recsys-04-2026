@@ -1,1 +1,3 @@
-run_id,model,dataset_size,split,val_score,test_score,config_path
+run_id,model,dataset_size,split,score,config_path
+20260428_143916,pop,50m,val,58.0252,configs/model/pop.yaml
+20260428_143916,pop,50m,test,57.1888,configs/model/pop.yaml

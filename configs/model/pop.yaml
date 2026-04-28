@@ -1,0 +1,3 @@
+_target_: src.models.pop.DecayPop
+name: pop
+half_life_units: 86400
