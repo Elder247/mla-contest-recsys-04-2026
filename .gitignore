@@ -18,6 +18,26 @@ multirun/
 # jupyter checkpoints
 .ipynb_checkpoints/
 
+# pytest
+.pytest_cache/
+
+# логи обучения
+*.log
+runs/
+wandb/
+catboost_info/
+
+# numpy кэши (implicit, sklearn)
+*.npy
+*.npz
+
+# Optuna SQLite
+*.db
+
+# покрытие тестов
+.coverage
+htmlcov/
+
 # IDE
 .DS_Store
 .idea/

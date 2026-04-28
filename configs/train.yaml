@@ -1,0 +1,8 @@
+defaults:
+  - data: 50m
+  - split: temporal
+  - model: ???
+  - _self_
+
+seed: 42
+output_dir: artifacts

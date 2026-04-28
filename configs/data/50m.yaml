@@ -1,0 +1,14 @@
+# @package _global_
+data:
+  size: "50m"
+  root: "data"
+  listens: "data/50m/listens.parquet"
+  likes: "data/50m/likes.parquet"
+  dislikes: "data/50m/dislikes.parquet"
+  unlikes: "data/50m/unlikes.parquet"
+  undislikes: "data/50m/undislikes.parquet"
+  multi_event: "data/50m/multi_event.parquet"
+  embeddings: "data/embeddings.parquet"
+  album_item_mapping: "data/album_item_mapping.parquet"
+  artist_item_mapping: "data/artist_item_mapping.parquet"
+  users_csv: "submissions/users.csv"

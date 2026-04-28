@@ -1,0 +1,6 @@
+# @package _global_
+split:
+  name: temporal
+  val_days: 7
+  gap_days: 1
+  timestamp_col: timestamp

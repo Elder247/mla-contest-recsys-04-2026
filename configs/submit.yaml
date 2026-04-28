@@ -1,0 +1,9 @@
+defaults:
+  - data: 50m
+  - model: ???
+  - _self_
+
+seed: 42
+top_k: 100
+submission_dir: submissions
+run_id: ???
