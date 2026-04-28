@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest tests/ -v)",
+      "Bash(pytest tests/ -v -x)",
+      "Bash(pytest tests/*)",
+      "Bash(python --version)",
+      "Bash(python3 --version)",
+      "Bash(pip list)",
+      "Bash(pip show *)"
+    ]
+  }
+}
