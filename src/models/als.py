@@ -72,7 +72,14 @@ class ALSModel(BaseModel):
     def recommend(self, users: list[int], n: int = 100, **kwargs) -> pl.DataFrame:
         known = [u for u in users if u in self._uid_map]
         if not known:
-            return pl.DataFrame(schema={"uid": pl.Int64, "item_id": pl.Int64, "score": pl.Float32, "als_rank": pl.Int32})
+            return pl.DataFrame(
+                schema={
+                    "uid": pl.Int64,
+                    "item_id": pl.Int64,
+                    "score": pl.Float32,
+                    "als_rank": pl.Int32
+                }
+            )
 
         idxs = [self._uid_map[u] for u in known]
         recs, scores = self._model.recommend(
