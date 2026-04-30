@@ -209,6 +209,7 @@ def main(cfg: DictConfig) -> None:
         artist_map_lf=artist_map_lf,
         album_map_lf=album_map_lf,
         cutoff_ts=cutoff_ts,
+        embeddings_path=cfg.data.embeddings if cfg.get("enable_embed_features", True) else None,
     )
 
     if cfg.cache_features:
@@ -245,6 +246,7 @@ def main(cfg: DictConfig) -> None:
         artist_map_lf=artist_map_lf,
         album_map_lf=album_map_lf,
         cutoff_ts=cutoff_ts,
+        embeddings_path=cfg.data.embeddings if cfg.get("enable_embed_features", True) else None,
     )
     if cfg.cache_features:
         features_dir = Path(cfg.features_dir)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import polars as pl
 
 log = logging.getLogger(__name__)
@@ -235,13 +236,15 @@ def build_pair_features(
     cutoff_ts: int,
     decay_half_life_units: int = DEFAULT_DECAY_HALF_LIFE,
 ) -> pl.LazyFrame:
-    """Pair-level features (key: ``(uid, item_id)``). ~16 features.
+    """Pair-level features (key: ``(uid, item_id)``). ~20 features.
 
     KEY OPTIMISATION: semi-join listens with candidates BEFORE group_by.
     On 50m: 30M rows → ~9M; on 5B: 4.65B → ~700M. Without this, group_by
     on the full listens table OOMs.
     """
     cutoff_7d = cutoff_ts - 7 * ONE_DAY_TS
+    cutoff_30d = cutoff_ts - 30 * ONE_DAY_TS
+    cutoff_90d = cutoff_ts - 90 * ONE_DAY_TS
 
     cand_pairs = (
         candidates_lf
@@ -289,6 +292,12 @@ def build_pair_features(
             pl.col("is_organic").cast(pl.Float32).mean().alias("pair_share_organic"),
             decay_expr.sum().cast(pl.Float32).alias("pair_decay_listens"),
             (pl.col("timestamp") >= cutoff_7d).sum().cast(pl.Int32).alias("_pair_n_listens_7d"),
+            (pl.col("timestamp") >= cutoff_30d).sum().cast(pl.Int32).alias("pair_n_listens_30d"),
+            (pl.col("timestamp") >= cutoff_90d).sum().cast(pl.Int32).alias("pair_n_listens_90d"),
+            pl.col("played_ratio_pct").filter(pl.col("timestamp") >= cutoff_30d)
+                .mean().cast(pl.Float32).alias("pair_avg_played_ratio_30d"),
+            pl.col("played_ratio_pct").filter(pl.col("timestamp") >= cutoff_30d)
+                .max().cast(pl.Float32).alias("pair_max_played_ratio_30d"),
             played_seconds_expr.mean().cast(pl.Float32).alias("pair_avg_played_seconds"),
         ])
         .with_columns([
@@ -462,6 +471,289 @@ def build_cross_features(
 
 
 # ---------------------------------------------------------------------------
+# Audio-embedding ranker features (Phase C.4 / D4)
+# ---------------------------------------------------------------------------
+
+def build_embed_features(
+    candidates_lf: pl.LazyFrame,
+    listens_lf: pl.LazyFrame,
+    likes_lf: pl.LazyFrame,
+    unlikes_lf: pl.LazyFrame,
+    dislikes_lf: pl.LazyFrame,
+    undislikes_lf: pl.LazyFrame,
+    embeddings_path: str,
+    cutoff_ts: int,
+    last_k: int = 20,
+) -> pl.LazyFrame:
+    """Per-candidate audio-embedding cosine features (key: ``(uid, item_id)``).
+
+    Four ranker features — orthogonal to the AudioEmbedKNN CG (which does
+    *retrieval*; these features give CatBoost a per-candidate similarity
+    score it can weigh against other signals):
+
+      * ``embed_cos_user_mean``       — vs L2-normed mean of all user listens
+      * ``embed_cos_user_last_k``     — vs mean of last ``last_k`` listens
+      * ``embed_cos_user_liked_mean`` — vs mean of effective likes (likes − unlikes)
+      * ``embed_cos_user_disliked_mean`` — vs mean of effective dislikes (negative signal)
+
+    Implementation: materialises only the rows / items needed (semi-join on
+    candidate items + per-user history items), loads embeddings restricted
+    to that set, builds 4 user-mean vectors via numpy scatter-add, then
+    rows-row dot product with the item embedding for each candidate.
+
+    Items / users with no embedding coverage emit NULL — CatBoost handles
+    that via ``nan_mode="Min"``. Cosine = inner-product because embeddings
+    are L2-normalised in the parquet (``normalized_embed``).
+
+    Returns a LazyFrame keyed by ``(uid, item_id)`` with the 4 cos columns
+    (``Float32``), suitable for left-join in :func:`add_features`.
+    """
+    cand_pairs_eager = (
+        candidates_lf
+        .select(["uid", "item_id"])
+        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+        .unique()
+        .collect()
+    )
+    log.info("build_embed_features: %d candidate pairs", len(cand_pairs_eager))
+
+    # ── Determine which items we need embeddings for ────────────────────────
+    # We need:
+    #   (a) every candidate item (to look up the candidate's own embedding)
+    #   (b) every item that appears in any user's relevant history
+    #       (positive listens / likes / dislikes within cutoff)
+    cand_items = cand_pairs_eager["item_id"].unique()
+
+    L_pos = (
+        listens_lf
+        .filter(pl.col("timestamp") <= cutoff_ts)
+        .filter(pl.col("played_ratio_pct") > 50)
+        .select(["uid", "item_id", "timestamp"])
+        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+    )
+    listen_items = L_pos.select("item_id").unique().collect()["item_id"]
+
+    likes_active = _effective_likes_lf(likes_lf, unlikes_lf, cutoff_ts)
+    like_items = likes_active.select("item_id").unique().collect()["item_id"]
+
+    dislikes_active = _effective_dislikes_lf(dislikes_lf, undislikes_lf, cutoff_ts)
+    dislike_items = dislikes_active.select("item_id").unique().collect()["item_id"]
+
+    items_needed = (
+        pl.concat([cand_items, listen_items, like_items, dislike_items])
+        .unique()
+        .to_list()
+    )
+    log.info(
+        "build_embed_features: %d items need embeddings (cands=%d, listens=%d, likes=%d, dislikes=%d)",
+        len(items_needed), len(cand_items), len(listen_items),
+        len(like_items), len(dislike_items),
+    )
+
+    # ── Load embeddings ─────────────────────────────────────────────────────
+    emb_df = (
+        pl.scan_parquet(embeddings_path)
+        .filter(pl.col("item_id").is_in(items_needed))
+        .select(["item_id", "normalized_embed"])
+        .collect()
+    )
+    if len(emb_df) == 0:
+        log.warning("build_embed_features: no embeddings matched — returning NULL features")
+        return _empty_embed_frame(cand_pairs_eager).lazy()
+
+    emb_arr = np.asarray(emb_df["normalized_embed"].to_list(), dtype=np.float32)
+    emb_item_ids = emb_df["item_id"].cast(pl.Int64).to_numpy()
+    item_to_row: dict[int, int] = {int(i): k for k, i in enumerate(emb_item_ids.tolist())}
+    dim = emb_arr.shape[1]
+    log.info("build_embed_features: embedding matrix %s", emb_arr.shape)
+
+    # ── Build user mean vectors (4 variants) ─────────────────────────────────
+    # All means produce arrays of shape (n_users, dim) indexed by ``uids_with_*``.
+    listens_user_item = (
+        L_pos
+        .filter(pl.col("item_id").is_in(items_needed))
+        .select(["uid", "item_id", "timestamp"])
+        .collect()
+    )
+    likes_user_item = (
+        likes_active
+        .filter(pl.col("item_id").is_in(items_needed))
+        .select(["uid", "item_id"])
+        .collect()
+    )
+    dislikes_user_item = (
+        dislikes_active
+        .filter(pl.col("item_id").is_in(items_needed))
+        .select(["uid", "item_id"])
+        .collect()
+    )
+
+    mean_all = _user_mean_embeddings(listens_user_item, item_to_row, emb_arr, dim)
+    mean_lastk = _user_mean_last_k(listens_user_item, last_k, item_to_row, emb_arr, dim)
+    mean_liked = _user_mean_embeddings(likes_user_item, item_to_row, emb_arr, dim)
+    mean_disliked = _user_mean_embeddings(dislikes_user_item, item_to_row, emb_arr, dim)
+
+    # ── Compute 4 cosines per candidate ──────────────────────────────────────
+    # Candidate → item_emb_row (-1 if missing); user → 4 user_emb_row variants.
+    cand_pdf = cand_pairs_eager.to_pandas()
+    cand_pdf["item_row"] = cand_pdf["item_id"].map(item_to_row).astype("Int64")
+
+    def _cos_for(user_means: dict[int, int], user_emb: np.ndarray) -> np.ndarray:
+        """Vectorised cos for the candidate set against the given user-mean dict."""
+        u_rows = cand_pdf["uid"].map(user_means).astype("Int64")
+        # mask: both item and user vectors present
+        mask = cand_pdf["item_row"].notna() & u_rows.notna()
+        out = np.full(len(cand_pdf), np.nan, dtype=np.float32)
+        if not mask.any():
+            return out
+        ir = cand_pdf.loc[mask, "item_row"].to_numpy(dtype=np.int64)
+        ur = u_rows[mask].to_numpy(dtype=np.int64)
+        # Both emb_arr rows and user_emb rows are L2-normalised → dot == cosine.
+        out[mask.to_numpy()] = (emb_arr[ir] * user_emb[ur]).sum(axis=1).astype(np.float32)
+        return out
+
+    cos_all = _cos_for(*mean_all)
+    cos_lastk = _cos_for(*mean_lastk)
+    cos_liked = _cos_for(*mean_liked)
+    cos_disliked = _cos_for(*mean_disliked)
+
+    return (
+        pl.DataFrame({
+            "uid": cand_pdf["uid"].to_numpy(),
+            "item_id": cand_pdf["item_id"].to_numpy(),
+            "embed_cos_user_mean": cos_all,
+            "embed_cos_user_last_k": cos_lastk,
+            "embed_cos_user_liked_mean": cos_liked,
+            "embed_cos_user_disliked_mean": cos_disliked,
+        })
+        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+        .lazy()
+    )
+
+
+def _effective_likes_lf(
+    likes_lf: pl.LazyFrame,
+    unlikes_lf: pl.LazyFrame,
+    cutoff_ts: int,
+) -> pl.LazyFrame:
+    """``(uid, item_id)`` pairs that are *currently* liked at ``cutoff_ts``."""
+    last_like = (
+        likes_lf.filter(pl.col("timestamp") <= cutoff_ts)
+        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+        .group_by(["uid", "item_id"])
+        .agg(pl.col("timestamp").max().alias("_lts"))
+    )
+    last_unlike = (
+        unlikes_lf.filter(pl.col("timestamp") <= cutoff_ts)
+        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+        .group_by(["uid", "item_id"])
+        .agg(pl.col("timestamp").max().alias("_uts"))
+    )
+    return (
+        last_like
+        .join(last_unlike, on=["uid", "item_id"], how="left")
+        .filter(pl.col("_uts").is_null() | (pl.col("_lts") > pl.col("_uts")))
+        .select(["uid", "item_id"])
+    )
+
+
+def _effective_dislikes_lf(
+    dislikes_lf: pl.LazyFrame,
+    undislikes_lf: pl.LazyFrame,
+    cutoff_ts: int,
+) -> pl.LazyFrame:
+    """LazyFrame variant of ``dataset.effective_dislikes`` — same semantics."""
+    last_dis = (
+        dislikes_lf.filter(pl.col("timestamp") <= cutoff_ts)
+        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+        .group_by(["uid", "item_id"])
+        .agg(pl.col("timestamp").max().alias("_dts"))
+    )
+    last_undis = (
+        undislikes_lf.filter(pl.col("timestamp") <= cutoff_ts)
+        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+        .group_by(["uid", "item_id"])
+        .agg(pl.col("timestamp").max().alias("_udts"))
+    )
+    return (
+        last_dis
+        .join(last_undis, on=["uid", "item_id"], how="left")
+        .filter(pl.col("_udts").is_null() | (pl.col("_dts") > pl.col("_udts")))
+        .select(["uid", "item_id"])
+    )
+
+
+def _user_mean_embeddings(
+    pairs: pl.DataFrame,
+    item_to_row: dict[int, int],
+    emb_arr: np.ndarray,
+    dim: int,
+) -> tuple[dict[int, int], np.ndarray]:
+    """For each uid, average emb_arr rows of the items it pairs with.
+
+    Returns ``(uid -> row_idx, mean_emb)`` where ``mean_emb`` is L2-normed
+    so dot product against item rows is cosine similarity.
+    """
+    if len(pairs) == 0:
+        return {}, np.zeros((0, dim), dtype=np.float32)
+
+    df = pairs.to_pandas()
+    df["row"] = df["item_id"].map(item_to_row).astype("Int64")
+    df = df.dropna(subset=["row"])
+    if len(df) == 0:
+        return {}, np.zeros((0, dim), dtype=np.float32)
+    df["row"] = df["row"].astype(np.int64)
+
+    uids = df["uid"].to_numpy()
+    rows = df["row"].to_numpy()
+    unique_uids, inv = np.unique(uids, return_inverse=True)
+    sums = np.zeros((len(unique_uids), dim), dtype=np.float32)
+    counts = np.zeros(len(unique_uids), dtype=np.int32)
+    np.add.at(sums, inv, emb_arr[rows])
+    np.add.at(counts, inv, 1)
+    means = sums / counts[:, None].astype(np.float32)
+    norms = np.linalg.norm(means, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    means = (means / norms).astype(np.float32)
+    uid_to_row = {int(u): k for k, u in enumerate(unique_uids.tolist())}
+    return uid_to_row, means
+
+
+def _user_mean_last_k(
+    listens_pairs: pl.DataFrame,
+    last_k: int,
+    item_to_row: dict[int, int],
+    emb_arr: np.ndarray,
+    dim: int,
+) -> tuple[dict[int, int], np.ndarray]:
+    """User mean over their last ``last_k`` listens (chronological)."""
+    if len(listens_pairs) == 0:
+        return {}, np.zeros((0, dim), dtype=np.float32)
+    last_k_df = (
+        listens_pairs
+        .sort(["uid", "timestamp"], descending=[False, True])
+        .group_by("uid", maintain_order=True)
+        .head(last_k)
+        .select(["uid", "item_id"])
+    )
+    return _user_mean_embeddings(last_k_df, item_to_row, emb_arr, dim)
+
+
+def _empty_embed_frame(cand_pairs: pl.DataFrame) -> pl.DataFrame:
+    """All-NULL embed feature frame for the case of no embedding coverage."""
+    n = len(cand_pairs)
+    null_col = np.full(n, np.nan, dtype=np.float32)
+    return pl.DataFrame({
+        "uid": cand_pairs["uid"].to_numpy(),
+        "item_id": cand_pairs["item_id"].to_numpy(),
+        "embed_cos_user_mean": null_col,
+        "embed_cos_user_last_k": null_col,
+        "embed_cos_user_liked_mean": null_col,
+        "embed_cos_user_disliked_mean": null_col,
+    }).with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -476,8 +768,10 @@ def add_features(
     album_map_lf: pl.LazyFrame,
     cutoff_ts: int,
     decay_half_life_units: int = DEFAULT_DECAY_HALF_LIFE,
+    embeddings_path: str | None = None,
+    embed_last_k: int = 20,
 ) -> pl.LazyFrame:
-    """Enrich candidates with user / item / pair / cross features.
+    """Enrich candidates with user / item / pair / cross / embed features.
 
     The result preserves the original ``candidates_lf`` rows (left-joins
     everywhere) plus all feature columns. Caller decides on materialisation:
@@ -486,6 +780,9 @@ def add_features(
         df = features_lf.collect(streaming=True)
         # OR
         features_lf.sink_parquet("cache.parquet", compression="zstd")
+
+    ``embeddings_path``: if provided, append 4 audio-embedding cosine
+    features (Phase C.4). Pass ``None`` (default) to skip.
     """
     user_feats = build_user_features(
         listens_lf, likes_lf, dislikes_lf, unlikes_lf,
@@ -509,7 +806,24 @@ def add_features(
         .join(item_feats, on="item_id", how="left")
         .join(pair_feats, on=["uid", "item_id"], how="left")
         .join(cross_feats, on=["uid", "item_id"], how="left")
+        # Cross feature: how stale is this pair vs the user's overall recency.
+        # Adds 1d to the denominator to avoid div-by-0 for hyperactive users.
+        .with_columns(
+            (
+                pl.col("pair_days_since_last_listen").cast(pl.Float32)
+                / (pl.col("user_recency_last_listen").cast(pl.Float32) + 1.0)
+            ).cast(pl.Float32).alias("pair_recency_ratio")
+        )
     )
+
+    if embeddings_path is not None:
+        embed_feats = build_embed_features(
+            candidates_lf, listens_lf, likes_lf, unlikes_lf,
+            dislikes_lf, undislikes_lf,
+            embeddings_path, cutoff_ts, embed_last_k,
+        )
+        enriched_cands = enriched_cands.join(embed_feats, on=["uid", "item_id"], how="left")
+
     return enriched_cands
 
 

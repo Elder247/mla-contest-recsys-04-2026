@@ -23,6 +23,10 @@ cache_features: false
 # CatBoost native feature_importance saved as artifacts/feature_importance_{run_id}.csv
 compute_feature_importance: true
 
+# Phase C.4 — append 4 audio-embedding cosine ranker features. Set false
+# to skip (saves ~10-20 s of feature build on 50m).
+enable_embed_features: true
+
 output_dir: artifacts        # results.csv, feature_importance_*.csv
 ranker_dir: artifacts        # ranker_{run_id}.pkl
 features_dir: artifacts/features
