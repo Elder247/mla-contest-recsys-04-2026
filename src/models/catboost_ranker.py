@@ -20,12 +20,14 @@ class RankerModel:
         iterations: int = 500,
         depth: int = 6,
         learning_rate: float = 0.1,
+        l2_leaf_reg: float = 3.0,
         early_stopping_rounds: int = 50,
         random_state: int = 42,
     ):
         self.iterations = iterations
         self.depth = depth
         self.learning_rate = learning_rate
+        self.l2_leaf_reg = l2_leaf_reg
         self.early_stopping_rounds = early_stopping_rounds
         self.random_state = random_state
         self._model: CatBoostRanker | None = None
@@ -47,6 +49,7 @@ class RankerModel:
             iterations=self.iterations,
             depth=self.depth,
             learning_rate=self.learning_rate,
+            l2_leaf_reg=self.l2_leaf_reg,
             random_seed=self.random_state,
             verbose=100,
             nan_mode="Min",

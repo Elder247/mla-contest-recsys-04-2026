@@ -3,4 +3,4 @@ name: artist_pop
 entity: artist
 top_entities: 10
 n_cand: 100
-half_life_units: 86400
+half_life_units: 518400

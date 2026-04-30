@@ -92,11 +92,13 @@ pytest tests/ -v
 ```
 
 ## Запуск долгих команд (обучение)
-Все долгие bash-команды (train, evaluate, make_submission) запускать в фоне с логом в файл:
+Все долгие bash-команды (train, evaluate, make_submission) запускать в фоне с логом в файл и **обязательным флагом `-u`** для unbuffered stdout:
 ```bash
-python scripts/train_ranker.py data=50m 2>&1 | tee /tmp/train.log
+python -u scripts/train_ranker.py data=50m 2>&1 | tee /tmp/train.log
 ```
 Использовать `run_in_background=true` в Bash-инструменте.
+
+**Зачем `-u`**: CatBoost (и любой `print`/tqdm) пишет в stdout. При пайпе `| tee` Python автоматически переключает stdout на block-buffered (~8KB) → прогресс по итерациям и tqdm-бары появляются в логе только после завершения процесса. Флаг `-u` (или env `PYTHONUNBUFFERED=1`) отключает буферизацию, чтобы строки лились в `tee` сразу. Для `logging` это не нужно (оно идёт в stderr и unbuffered), но для CatBoost `verbose=N` — критично.
 
 **Пользователю:** чтобы следить за прогрессом в реальном времени, открой терминал и выполни:
 ```bash

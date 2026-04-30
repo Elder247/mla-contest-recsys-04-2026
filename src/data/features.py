@@ -30,7 +30,7 @@ import polars as pl
 log = logging.getLogger(__name__)
 
 ONE_DAY_TS = 17_280  # 5-second units in 24h
-DEFAULT_DECAY_HALF_LIFE = 86_400  # ~5 days, matches DecayPop
+DEFAULT_DECAY_HALF_LIFE = 518_400  # ~30 days, empirical half-life from EDA (notebooks/01_eda.ipynb §time-decay)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +147,7 @@ def build_user_features(
                 pl.col("user_n_dislikes").cast(pl.Float32)
                 / (pl.col("user_n_listens").cast(pl.Float32) + 1.0)
             ).cast(pl.Float32).alias("user_dislike_rate"),
+            pl.col("user_n_listens").cast(pl.Float32).log1p().cast(pl.Float32).alias("user_n_listens_log"),
             pl.col("uid").cast(pl.Int64),
         ])
     )
@@ -232,13 +233,16 @@ def build_pair_features(
     unlikes_lf: pl.LazyFrame,
     undislikes_lf: pl.LazyFrame,
     cutoff_ts: int,
+    decay_half_life_units: int = DEFAULT_DECAY_HALF_LIFE,
 ) -> pl.LazyFrame:
-    """Pair-level features (key: ``(uid, item_id)``). ~12 features.
+    """Pair-level features (key: ``(uid, item_id)``). ~16 features.
 
     KEY OPTIMISATION: semi-join listens with candidates BEFORE group_by.
     On 50m: 30M rows → ~9M; on 5B: 4.65B → ~700M. Without this, group_by
     on the full listens table OOMs.
     """
+    cutoff_7d = cutoff_ts - 7 * ONE_DAY_TS
+
     cand_pairs = (
         candidates_lf
         .select(["uid", "item_id"])
@@ -259,6 +263,17 @@ def build_pair_features(
         .join(cand_pairs, on=["uid", "item_id"], how="semi")
     )
 
+    decay_expr = (
+        pl.lit(2.0).pow(
+            (pl.col("timestamp").cast(pl.Float64) - cutoff_ts) / decay_half_life_units
+        )
+    )
+    played_seconds_expr = (
+        pl.col("played_ratio_pct").cast(pl.Float32)
+        * pl.col("track_length_seconds").cast(pl.Float32)
+        / 100.0
+    )
+
     pair_listen_aggs = (
         rel_listens
         .group_by(["uid", "item_id"])
@@ -272,7 +287,21 @@ def build_pair_features(
             ((cutoff_ts - pl.col("timestamp").max()).cast(pl.Float32) / ONE_DAY_TS).alias("pair_days_since_last_listen"),
             ((cutoff_ts - pl.col("timestamp").min()).cast(pl.Float32) / ONE_DAY_TS).alias("pair_days_since_first_listen"),
             pl.col("is_organic").cast(pl.Float32).mean().alias("pair_share_organic"),
+            decay_expr.sum().cast(pl.Float32).alias("pair_decay_listens"),
+            (pl.col("timestamp") >= cutoff_7d).sum().cast(pl.Int32).alias("_pair_n_listens_7d"),
+            played_seconds_expr.mean().cast(pl.Float32).alias("pair_avg_played_seconds"),
         ])
+        .with_columns([
+            (
+                pl.col("pair_n_listens").cast(pl.Float32)
+                / (pl.col("pair_days_since_first_listen").cast(pl.Float32) + 1.0)
+            ).cast(pl.Float32).alias("pair_listens_per_day"),
+            (
+                pl.col("_pair_n_listens_7d").cast(pl.Float32)
+                / (pl.col("pair_n_listens").cast(pl.Float32) + 1e-6)
+            ).cast(pl.Float32).alias("pair_share_recent_listens"),
+        ])
+        .drop("_pair_n_listens_7d")
     )
 
     # Effective like = like exists AND no later unlike for the same pair.
@@ -467,6 +496,7 @@ def add_features(
     )
     pair_feats = build_pair_features(
         candidates_lf, listens_lf, likes_lf, unlikes_lf, undislikes_lf, cutoff_ts,
+        decay_half_life_units,
     )
     cross_feats = build_cross_features(
         candidates_lf, listens_lf, artist_map_lf, album_map_lf, cutoff_ts,

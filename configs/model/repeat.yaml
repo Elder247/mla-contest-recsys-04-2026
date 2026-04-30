@@ -1,4 +1,4 @@
 _target_: src.models.repeat.RepeatListenModel
 name: repeat
 n_cand: 200
-half_life_units: 86400
+half_life_units: 518400

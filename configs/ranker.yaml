@@ -5,7 +5,7 @@ defaults:
 
 seed: 42
 top_k: 100
-run_id: "006"
+run_id: "007"
 
 # Set true to ignore cached CG pickles and refit from scratch.
 force_refit_cg: false
@@ -36,7 +36,7 @@ candidate_generators:
   - _target_: src.models.pop.DecayPop
     name: decaypop
     n_cand: 100
-    half_life_units: 86400
+    half_life_units: 518400
 
   - _target_: src.models.als.ALSModel
     name: als
@@ -55,7 +55,7 @@ candidate_generators:
   - _target_: src.models.repeat.RepeatListenModel
     name: repeat
     n_cand: 200
-    half_life_units: 86400
+    half_life_units: 518400
 
   - _target_: src.models.itemknn.ItemKNNModel
     name: itemknn
@@ -67,19 +67,27 @@ candidate_generators:
     entity: artist
     top_entities: 10
     n_cand: 100
-    half_life_units: 86400
+    half_life_units: 518400
+
+  - _target_: src.models.artist_pop.ArtistAlbumPopModel
+    name: album_pop
+    entity: album
+    top_entities: 10
+    n_cand: 100
+    half_life_units: 518400
 
   - _target_: src.models.recent_likes.RecentLikesModel
     name: recent_likes
     n_cand: 100
-    half_life_units: 86400
+    half_life_units: 518400
     data_source: likes
 
 ranker:
-  iterations: 500
+  iterations: 2000
   depth: 6
-  learning_rate: 0.1
-  early_stopping_rounds: 50
+  learning_rate: 0.05
+  l2_leaf_reg: 5.0
+  early_stopping_rounds: 100
   random_state: 42
 
 hydra:
