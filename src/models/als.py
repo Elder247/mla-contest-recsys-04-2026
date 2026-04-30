@@ -37,6 +37,8 @@ class ALSModel(BaseModel):
         n_cand: int = 500,
         high_engagement_weight: float = 3.0,
         mid_engagement_weight: float = 1.0,
+        low_engagement_weight: float = 0.0,
+        mid_threshold: float = 50.0,
         high_threshold: float = 80.0,
         random_state: int = 42,
     ):
@@ -48,6 +50,8 @@ class ALSModel(BaseModel):
         self.n_cand = n_cand
         self.high_engagement_weight = high_engagement_weight
         self.mid_engagement_weight = mid_engagement_weight
+        self.low_engagement_weight = low_engagement_weight
+        self.mid_threshold = mid_threshold
         self.high_threshold = high_threshold
         self.random_state = random_state
 
@@ -58,27 +62,37 @@ class ALSModel(BaseModel):
         self._inv_item_map: dict = {}
 
     def fit(self, train: pl.DataFrame, **kwargs) -> None:
-        pos = positive_listens(train)
-        uid_map, item_map, _, inv_item_map = build_id_maps(pos)
+        # When low > 0 we want *all* listens (incl. skipped tracks) so the
+        # 3rd weight tier gets actual rows. Otherwise stick with the historical
+        # behaviour of training on positive_listens only.
+        use_all_listens = self.low_engagement_weight > 0
+        df = train if use_all_listens else positive_listens(train)
+        uid_map, item_map, _, inv_item_map = build_id_maps(df)
 
-        weighted = self.high_engagement_weight != self.mid_engagement_weight
+        weighted = (
+            self.high_engagement_weight != self.mid_engagement_weight
+            or use_all_listens
+        )
         if weighted:
-            pos = add_engagement_weights(
-                pos,
+            df = add_engagement_weights(
+                df,
                 high=self.high_engagement_weight,
                 mid=self.mid_engagement_weight,
+                low=self.low_engagement_weight,
+                mid_threshold=self.mid_threshold,
                 high_threshold=self.high_threshold,
             )
-            matrix = build_csr_matrix(pos, uid_map, item_map, weight_col="weight")
+            matrix = build_csr_matrix(df, uid_map, item_map, weight_col="weight")
         else:
-            matrix = build_csr_matrix(pos, uid_map, item_map)
+            matrix = build_csr_matrix(df, uid_map, item_map)
 
         log.info(
-            "fitting ALS: users=%d items=%d factors=%d iters=%d alpha=%.1f weighted=%s "
-            "(high=%.2f mid=%.2f thr=%.1f)",
+            "fitting ALS: users=%d items=%d factors=%d iters=%d alpha=%.1f "
+            "weighted=%s use_all_listens=%s (high=%.2f mid=%.2f low=%.2f thr=%.1f/%.1f)",
             len(uid_map), len(item_map), self.factors, self.iterations, self.alpha,
-            weighted, self.high_engagement_weight, self.mid_engagement_weight,
-            self.high_threshold,
+            weighted, use_all_listens,
+            self.high_engagement_weight, self.mid_engagement_weight,
+            self.low_engagement_weight, self.mid_threshold, self.high_threshold,
         )
         model = AlternatingLeastSquares(
             factors=self.factors,

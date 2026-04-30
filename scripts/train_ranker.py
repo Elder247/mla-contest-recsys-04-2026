@@ -30,7 +30,13 @@ import polars as pl
 from omegaconf import DictConfig, OmegaConf
 from sklearn.model_selection import GroupShuffleSplit
 
-from src.data.dataset import load_dislikes, load_listens, positive_listens
+from src.data.dataset import (
+    effective_dislikes,
+    load_dislikes,
+    load_listens,
+    load_undislikes,
+    positive_listens,
+)
 from src.data.splits import temporal_split
 from src.evaluation.metrics import recall_at_k
 from src.inference.merge_candidates import cg_recall, merge_candidates
@@ -129,18 +135,27 @@ def main(cfg: DictConfig) -> None:
     merged = merge_candidates(cg_dfs)
 
     if cfg.filter_dislikes:
-        # Use only dislikes recorded up to the train cutoff to avoid leaking
+        # Use only events recorded up to the train cutoff to avoid leaking
         # validation-period information into the offline eval.
         train_max_ts = float(split.train["timestamp"].max())
         dislikes_train = (
             load_dislikes(path=cfg.data.dislikes)
             .filter(pl.col("timestamp") <= train_max_ts)
         )
-        before = len(merged)
-        merged = apply_exclude_filter(merged, dislikes_train)
+        undislikes_train = (
+            load_undislikes(path=cfg.data.undislikes)
+            .filter(pl.col("timestamp") <= train_max_ts)
+        )
+        active_dislikes = effective_dislikes(dislikes_train, undislikes_train)
         log.info(
-            "dislike filter (train period): dropped %d / %d candidate rows; %d dislike pairs used",
-            before - len(merged), before, len(dislikes_train),
+            "effective dislikes (train period): %d active / %d raw / %d undislikes",
+            len(active_dislikes), len(dislikes_train), len(undislikes_train),
+        )
+        before = len(merged)
+        merged = apply_exclude_filter(merged, active_dislikes)
+        log.info(
+            "dislike filter: dropped %d / %d candidate rows",
+            before - len(merged), before,
         )
 
     upper_bound = cg_recall(merged, gt_val)
@@ -166,7 +181,7 @@ def main(cfg: DictConfig) -> None:
     cg_dfs_full = generate_candidates(cgs, eval_users)
     merged_full = merge_candidates(cg_dfs_full)
     if cfg.filter_dislikes:
-        merged_full = apply_exclude_filter(merged_full, dislikes_train)
+        merged_full = apply_exclude_filter(merged_full, active_dislikes)
     feats_full = add_basic_features(merged_full, split.train)
 
     preds_val = ranker.predict(feats_full, n=cfg.top_k)

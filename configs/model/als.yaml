@@ -7,5 +7,7 @@ alpha: 40.0
 n_cand: 500
 high_engagement_weight: 3.0
 mid_engagement_weight: 1.0
+low_engagement_weight: 0.3
+mid_threshold: 50.0
 high_threshold: 80.0
 random_state: 42

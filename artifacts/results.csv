@@ -13,3 +13,5 @@ run_id,model,dataset_size,split,score,config_path
 20260429_173718,"ranker[decaypop,als,repeat]",50m,test,308.3839,configs/ranker.yaml
 20260430_112535,"ranker[decaypop,als,repeat]",50m,val,306.2348,configs/ranker.yaml
 20260430_112535,"ranker[decaypop,als,repeat]",50m,test,305.9064,configs/ranker.yaml
+20260430_114649,"ranker[decaypop,als,repeat]",50m,val,308.5025,configs/ranker.yaml
+20260430_114649,"ranker[decaypop,als,repeat]",50m,test,307.8059,configs/ranker.yaml

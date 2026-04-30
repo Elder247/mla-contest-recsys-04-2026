@@ -5,7 +5,7 @@ defaults:
 
 seed: 42
 top_k: 100
-run_id: "003"
+run_id: "004"
 
 # Set true to ignore cached CG pickles and refit from scratch.
 force_refit_cg: false
@@ -47,6 +47,8 @@ candidate_generators:
     n_cand: 500
     high_engagement_weight: 3.0
     mid_engagement_weight: 1.0
+    low_engagement_weight: 0.3
+    mid_threshold: 50.0
     high_threshold: 80.0
     random_state: 42
 

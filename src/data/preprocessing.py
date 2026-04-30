@@ -30,20 +30,33 @@ def add_engagement_weights(
     df: pl.DataFrame,
     high: float = 3.0,
     mid: float = 1.0,
+    low: float = 0.0,
+    mid_threshold: float = 50.0,
     high_threshold: float = 80.0,
     weight_col: str = "weight",
 ) -> pl.DataFrame:
     """Append a per-row interaction weight derived from played_ratio_pct.
 
-    played_ratio_pct > high_threshold → ``high`` weight (typically 3.0)
-    50 < played_ratio_pct ≤ high_threshold → ``mid`` weight (typically 1.0)
+    Three tiers:
+        played_ratio_pct >  high_threshold  → ``high`` (default 3.0)
+        mid_threshold < ratio ≤ high       → ``mid``  (default 1.0)
+        ratio ≤ mid_threshold              → ``low``  (default 0.0 → row dropped)
 
-    Caller is responsible for filtering to positive listens beforehand.
+    If ``low == 0``, low-engagement listens get zero confidence — equivalent
+    to filtering them out. Set ``low > 0`` (typically 0.1–0.5) to feed weak
+    positive signal from skipped tracks into ALS, instead of discarding.
+
+    Negative ``low`` is rejected: implicit ALS treats values as confidence
+    multipliers and negative entries break the PSD assumption of the solver.
     """
+    if low < 0:
+        raise ValueError(f"low engagement weight must be ≥ 0, got {low}")
     return df.with_columns(
         pl.when(pl.col("played_ratio_pct") > high_threshold)
         .then(pl.lit(high, dtype=pl.Float32))
-        .otherwise(pl.lit(mid, dtype=pl.Float32))
+        .when(pl.col("played_ratio_pct") > mid_threshold)
+        .then(pl.lit(mid, dtype=pl.Float32))
+        .otherwise(pl.lit(low, dtype=pl.Float32))
         .alias(weight_col)
     )
 
