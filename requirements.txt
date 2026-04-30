@@ -1,17 +1,32 @@
-datasets==3.6.0
-implicit==0.7.2
-hydra-core==1.3.2
-lightfm-next==1.19.0
-numpy==2.2.4
-pandas==2.2.2
+# Yandex Music RecSys contest — runtime dependencies.
+#
+# For server installs with NVIDIA GPU, install CUDA-enabled torch FIRST,
+# then `pip install -r requirements.txt`:
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.6.0
+#   pip install -r requirements.txt
+#
+# pip will skip torch on the second call since it's already satisfied.
+
+# Data
 polars==1.31.0
 pyarrow==20.0.0
-scikit-learn==1.6.1
-scipy==1.15.2
-torch==2.6.0
-tqdm==4.67.1
-transformers==4.51.3
-catboost==1.2.10
-faiss-cpu==1.8.0
-pytest==8.3.5
+pandas==2.2.2          # polars.to_pandas() entry point used by CatBoost.Pool
+numpy==2.2.4
+scipy==1.15.2          # transitive of implicit (CSR matrices)
+
+# Models
+implicit==0.7.2        # ALS, ItemKNN
+catboost==1.2.10       # YetiRank ranker
+torch==2.6.0           # eSASRec
+faiss-cpu==1.13.2      # AudioEmbedKNN HNSW32 (server: faiss-gpu would be faster)
+
+# Optimisation
 optuna==4.3.0
+scikit-learn==1.6.1    # GroupShuffleSplit for ranker train/val split
+
+# Config / orchestration
+hydra-core==1.3.2
+
+# Tests
+pytest==8.3.5

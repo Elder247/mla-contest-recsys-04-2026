@@ -1,14 +1,18 @@
 # @package _global_
+# Override ``data.root`` on the command line to redirect reads/writes to a
+# different filesystem (e.g. a server's persistent disk):
+#     python -u scripts/train_ranker.py data=50m data.root=/mnt/dc-remote/data
 data:
   size: "50m"
   root: "data"
-  listens: "data/50m/listens.parquet"
-  likes: "data/50m/likes.parquet"
-  dislikes: "data/50m/dislikes.parquet"
-  unlikes: "data/50m/unlikes.parquet"
-  undislikes: "data/50m/undislikes.parquet"
-  multi_event: "data/50m/multi_event.parquet"
-  embeddings: "data/embeddings.parquet"
-  album_item_mapping: "data/album_item_mapping.parquet"
-  artist_item_mapping: "data/artist_item_mapping.parquet"
+  listens: "${data.root}/${data.size}/listens.parquet"
+  likes: "${data.root}/${data.size}/likes.parquet"
+  dislikes: "${data.root}/${data.size}/dislikes.parquet"
+  unlikes: "${data.root}/${data.size}/unlikes.parquet"
+  undislikes: "${data.root}/${data.size}/undislikes.parquet"
+  multi_event: "${data.root}/${data.size}/multi_event.parquet"
+  # Shared across sizes — embeddings + entity mappings live at ``${data.root}``.
+  embeddings: "${data.root}/embeddings.parquet"
+  album_item_mapping: "${data.root}/album_item_mapping.parquet"
+  artist_item_mapping: "${data.root}/artist_item_mapping.parquet"
   users_csv: "submissions/users.csv"

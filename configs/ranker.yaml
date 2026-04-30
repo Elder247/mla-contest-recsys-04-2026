@@ -27,10 +27,14 @@ compute_feature_importance: true
 # to skip (saves ~10-20 s of feature build on 50m).
 enable_embed_features: true
 
-output_dir: artifacts        # results.csv, feature_importance_*.csv
-ranker_dir: artifacts        # ranker_{run_id}.pkl
-features_dir: artifacts/features
-cg_cache_dir: artifacts/cg
+# All persisted state goes under ``artifacts_root``. Override on the CLI to
+# move to a different filesystem (e.g. server's persistent disk):
+#     python -u scripts/train_ranker.py ... artifacts_root=/mnt/dc-remote/artifacts
+artifacts_root: artifacts
+output_dir: ${artifacts_root}        # results.csv, feature_importance_*.csv
+ranker_dir: ${artifacts_root}        # ranker_{run_id}.pkl
+features_dir: ${artifacts_root}/features
+cg_cache_dir: ${artifacts_root}/cg
 
 # ── Candidate generators ─────────────────────────────────────────────────
 # Each entry is a Hydra-instantiable config. ``name`` becomes the CG's

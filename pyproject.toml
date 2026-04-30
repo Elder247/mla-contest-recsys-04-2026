@@ -5,7 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mla-contest"
 version = "0.1.0"
-requires-python = ">=3.10"
+# Tested on 3.12. Lower bound 3.11 for ``typing.Literal`` shorthand and
+# polars 1.x dtype features used in src/.
+requires-python = ">=3.11,<3.13"
 
 [tool.setuptools.packages.find]
 where = ["."]
