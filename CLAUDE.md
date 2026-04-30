@@ -11,9 +11,31 @@ uid,item_ids
 ```
 
 ## Архитектура решения
-Двухэтапная: **candidate generators** (~600-800/юзер) → **CatBoost Ranker** (top-100).
-Активные генераторы: DecayPop, ALS (weighted), RepeatListen, ItemKNN, ArtistAlbumPop, AudioEmbedKNN, eSASRec.
-Подробный план и текущий прогресс: [docs/roadmap.md](docs/roadmap.md)
+Двухэтапная: **candidate generators** (~700-1000/юзер после dedup) → **CatBoost Ranker** (top-100).
+
+Активные CG (8) в `configs/ranker.yaml`:
+
+| CG | Файл | n_cand | Назначение |
+|----|------|--------|------------|
+| `decaypop` | `pop.py` (DecayPop) | 100 | global popular fallback (cold users) |
+| `als` | `als.py` (3-tier weighted) | 500 | CF, low/mid/high engagement |
+| `repeat` | `repeat.py` (RepeatListenModel) | 200 | re-listen из истории |
+| `itemknn` | `itemknn.py` (CosineRecommender) | 200 | item-item KNN |
+| `artist_pop` | `artist_pop.py` (entity=artist) | 100 | top tracks favorite artists |
+| `album_pop` | `artist_pop.py` (entity=album) | 100 | top tracks favorite albums |
+| `recent_likes` | `recent_likes.py` (data_source=likes) | 100 | likes × decay |
+| `audio_knn` | `audio_knn.py` (FAISS HNSW32) | 100 | acoustic similarity, cold-cohort |
+
+`eSASRec` — stub, реализуем на сервере (Phase C). Подробный план: [docs/roadmap.md](docs/roadmap.md), история прогонов: [docs/experiment-log.md](docs/experiment-log.md).
+
+### RankerModel — split inference (важно для Optuna и 5B)
+`src/models/catboost_ranker.py` экспортирует три точки входа:
+
+- `score(df, chunk_size=500_000) → (uid, item_id, ranker_score)` — чанкует pandas-материализацию по N строк, сохраняет порядок входа. Память ≈ `chunk_size × n_features × 8B` независимо от размера. Используй для тюнинга n_cand allocation (Optuna): scoring делается ОДИН раз, top-k режется десятки раз с разными бюджетами без повторного предикта.
+- `RankerModel.top_k_per_user(df, k, score_col="ranker_score")` — `@staticmethod`, чистая функция от scored DataFrame, режет per-user top-k.
+- `predict(df, n=100, chunk_size=500_000)` — композиция `score → top_k_per_user`. Сигнатура и контракт прежние, train_ranker.py / submit_ranker.py не меняются.
+
+Это рефакторинг D1+D2 из roadmap. **На 500m/5B и в Optuna trials используй `score()` напрямую** — иначе будет OOM или N-кратный пересчёт.
 
 ## Данные (Yambda)
 Три размера: `50m` / `500m` / `5b`. **Разрабатывать на `50m` первым.**
@@ -30,6 +52,7 @@ uid,item_ids
 ## Стек
 - **Данные**: Polars (primary), PyArrow, Pandas
 - **Модели**: implicit (ALS/BPR), lightfm-next, PyTorch, transformers, catboost, optuna
+- **ANN-индекс**: `faiss-cpu==1.13.2` (HNSW32 / IndexFlatIP) для AudioEmbedKNN
 - **Config**: Hydra (`hydra-core==1.3.2`), конфиги под `configs/`
 - **Тесты**: pytest
 
@@ -38,25 +61,30 @@ uid,item_ids
 configs/
   data/             50m.yaml  500m.yaml
   model/            pop.yaml ✅  user_pop.yaml ✅  als.yaml ✅  repeat.yaml ✅
-                    itemknn.yaml ✅  artist_pop.yaml ✅  recent_likes.yaml ✅
-                    audio_knn.yaml (A3)
+                    itemknn.yaml ✅  artist_pop.yaml ✅  album_pop.yaml ✅
+                    recent_likes.yaml ✅  audio_knn.yaml ✅
   split/            temporal.yaml
   train.yaml  evaluate.yaml  submit.yaml
-  ranker.yaml ✅            # multi-CG + ranker pipeline
+  ranker.yaml ✅            # multi-CG + ranker pipeline (8 CG активных)
   submit_ranker.yaml ✅     # submission from saved ranker
 src/
   data/             dataset.py ✅  splits.py ✅  preprocessing.py ✅
-                    features.py (stub → A2.2)
+                    features.py ✅                       # LazyFrame FE, ~70 фич
   models/           base.py ✅  pop.py ✅  als.py ✅  repeat.py ✅
                     itemknn.py ✅  artist_pop.py ✅  recent_likes.py ✅
-                    catboost_ranker.py ✅  esasrec.py (stub → server)
+                    audio_knn.py ✅                      # FAISS HNSW32, cold cohort
+                    catboost_ranker.py ✅                # score/top_k_per_user/predict
+                    esasrec.py (stub → server)
   evaluation/       metrics.py ✅
   inference/        merge_candidates.py ✅  pipeline.py ✅
+                    validate_submission.py ✅            # формат-чекер
   training/         cg_cache.py ✅
   utils/            logging.py ✅
 scripts/            train.py ✅  evaluate.py ✅  make_submission.py ✅
                     train_ranker.py ✅      # train multi-CG + ranker, NO submission
                     submit_ranker.py ✅     # submission from saved ranker
+                    inspect_run.py ✅       # сводка run: hyperparams, top features, CGs, subs
+                    validate_submission.py ✅  # CLI вокруг src.inference.validate_submission
                     download_data.py ✅
 notebooks/          00_baseline.ipynb  01_eda.ipynb
 docs/               roadmap.md  dataset-description.md  data-dictionary.md  experiment-log.md
@@ -86,6 +114,12 @@ python scripts/submit_ranker.py data=50m run_id=003
 
 # Принудительно переобучить все CG (игнорировать кэш)
 python scripts/train_ranker.py data=50m run_id=003 force_refit_cg=true
+
+# Сводка run'а: ranker hyperparams, best_iter, top features, CG-кэши, валидация сабмитов
+python scripts/inspect_run.py 008 [--top 15]
+
+# Валидация формата сабмита (10k uid, ≤100 item_ids/row, no dups)
+python scripts/validate_submission.py submissions/sub_008_*.csv
 
 # Тесты
 pytest tests/ -v
@@ -158,6 +192,8 @@ return (
 - `submit_ranker.py` использует параллельный кэш с суффиксом `_full` — модели обучены на полных данных без сплита.
 - Принудительно переобучить: `force_refit_cg=true`.
 - Кэш нельзя переиспользовать между разными размерами данных — это явно отражено в имени файла.
+- **При изменении гиперпараметра CG (например, `half_life_units`) — ОБЯЗАТЕЛЬНО удалить соответствующий пикл** (`rm artifacts/cg/{name}_{size}{,_full}.pkl`) или запустить с `force_refit_cg=true`. Полей с hash'ом конфига в имени пикла нет — будет молча подгружен старый.
+- **Для CG с тяжёлыми ANN-индексами** (audio_knn → FAISS) — не пиклить сам индекс. Реализуй `__getstate__` (выкидывает `_index = None`) и `__setstate__` (пересобирает из `_item_matrix` через `_build_index()`). Пример в `src/models/audio_knn.py`. Это избегает зависимости от faiss pickle compatibility и заметно ускоряет load.
 
 ## Внешние референсы
 - https://github.com/antklen/recsys_challenge_2025
