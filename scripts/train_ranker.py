@@ -30,12 +30,13 @@ import polars as pl
 from omegaconf import DictConfig, OmegaConf
 from sklearn.model_selection import GroupShuffleSplit
 
-from src.data.dataset import load_listens, positive_listens
+from src.data.dataset import load_dislikes, load_listens, positive_listens
 from src.data.splits import temporal_split
 from src.evaluation.metrics import recall_at_k
 from src.inference.merge_candidates import cg_recall, merge_candidates
 from src.inference.pipeline import (
     add_basic_features,
+    apply_exclude_filter,
     generate_candidates,
     load_eval_users,
 )
@@ -124,8 +125,24 @@ def main(cfg: DictConfig) -> None:
     val_users_with_gt = gt_val["uid"].unique().to_list()
     cg_dfs = generate_candidates(cgs, val_users_with_gt)
 
-    # ── 4. Merge → cg_recall ─────────────────────────────────────────────────
+    # ── 4. Merge → optional dislike filter → cg_recall ───────────────────────
     merged = merge_candidates(cg_dfs)
+
+    if cfg.filter_dislikes:
+        # Use only dislikes recorded up to the train cutoff to avoid leaking
+        # validation-period information into the offline eval.
+        train_max_ts = float(split.train["timestamp"].max())
+        dislikes_train = (
+            load_dislikes(path=cfg.data.dislikes)
+            .filter(pl.col("timestamp") <= train_max_ts)
+        )
+        before = len(merged)
+        merged = apply_exclude_filter(merged, dislikes_train)
+        log.info(
+            "dislike filter (train period): dropped %d / %d candidate rows; %d dislike pairs used",
+            before - len(merged), before, len(dislikes_train),
+        )
+
     upper_bound = cg_recall(merged, gt_val)
     log.info("CG-recall@∞ on val (upper bound for ranker, ×1000 scale): %.2f", upper_bound)
 
@@ -148,6 +165,8 @@ def main(cfg: DictConfig) -> None:
     # ── 7. Eval Recall@100 on val + test ─────────────────────────────────────
     cg_dfs_full = generate_candidates(cgs, eval_users)
     merged_full = merge_candidates(cg_dfs_full)
+    if cfg.filter_dislikes:
+        merged_full = apply_exclude_filter(merged_full, dislikes_train)
     feats_full = add_basic_features(merged_full, split.train)
 
     preds_val = ranker.predict(feats_full, n=cfg.top_k)

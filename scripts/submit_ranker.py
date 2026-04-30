@@ -23,10 +23,11 @@ import hydra
 import polars as pl
 from omegaconf import DictConfig, OmegaConf
 
-from src.data.dataset import load_listens, positive_listens
+from src.data.dataset import load_dislikes, load_listens, positive_listens
 from src.inference.merge_candidates import merge_candidates
 from src.inference.pipeline import (
     add_basic_features,
+    apply_exclude_filter,
     generate_candidates,
     load_eval_users,
 )
@@ -81,9 +82,20 @@ def main(cfg: DictConfig) -> None:
         )
         cgs.append(cg)
 
-    # ── 4. Generate candidates → merge ───────────────────────────────────────
+    # ── 4. Generate candidates → merge → optional dislike filter ────────────
     cg_dfs = generate_candidates(cgs, eval_users)
     merged = merge_candidates(cg_dfs)
+
+    if cfg.filter_dislikes:
+        # Submission uses the full dislikes table — at inference time we know
+        # everything the user has disliked up to now.
+        dislikes = load_dislikes(path=cfg.data.dislikes)
+        before = len(merged)
+        merged = apply_exclude_filter(merged, dislikes)
+        log.info(
+            "dislike filter (full): dropped %d / %d candidate rows; %d dislike pairs used",
+            before - len(merged), before, len(dislikes),
+        )
 
     # ── 5. Features (computed on full listens) ───────────────────────────────
     feats = add_basic_features(merged, listens)

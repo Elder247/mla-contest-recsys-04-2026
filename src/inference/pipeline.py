@@ -40,6 +40,26 @@ def generate_candidates(
     return out
 
 
+def apply_exclude_filter(
+    candidates: pl.DataFrame,
+    exclude: pl.DataFrame,
+) -> pl.DataFrame:
+    """Drop ``(uid, item_id)`` pairs that appear in ``exclude``.
+
+    Used as a hard guard against recommending disliked items, which the
+    ranker score-feature alone cannot guarantee. Anti-join is cheap:
+    dislikes table is ~1M rows on 50M dataset.
+    """
+    return candidates.join(
+        exclude.select(["uid", "item_id"]).with_columns([
+            pl.col("uid").cast(pl.Int64),
+            pl.col("item_id").cast(pl.Int64),
+        ]).unique(),
+        on=["uid", "item_id"],
+        how="anti",
+    )
+
+
 def add_basic_features(candidates: pl.DataFrame, train: pl.DataFrame) -> pl.DataFrame:
     """Phase A1 placeholder — joins user_n_listens + item_pop only.
 

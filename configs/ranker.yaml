@@ -10,6 +10,12 @@ run_id: "003"
 # Set true to ignore cached CG pickles and refit from scratch.
 force_refit_cg: false
 
+# Hard guard: drop (uid, item_id) pairs found in dislikes.parquet from the
+# merged candidate pool before scoring. Complements the pair_is_disliked
+# ranker feature (added in A2): the feature is for soft signals around
+# disliked items, the filter ensures dislikes never reach top-100.
+filter_dislikes: true
+
 # Optional cache for the merged feature table (LazyFrame sink_parquet).
 # Phase A2 wires this up; A1 ignores it.
 cache_features: false
