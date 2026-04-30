@@ -56,6 +56,40 @@ def positive_listens(df: pl.DataFrame) -> pl.DataFrame:
     return df.filter(pl.col("played_ratio_pct") > 50)
 
 
+def effective_dislikes(
+    dislikes: pl.DataFrame,
+    undislikes: pl.DataFrame,
+) -> pl.DataFrame:
+    """Active dislikes only — those NOT reverted by a later undislike.
+
+    Per (uid, item_id) pair, take max dislike_ts and max undislike_ts.
+    If undislike_ts ≥ dislike_ts → user changed their mind, drop the pair.
+
+    Returns a DataFrame with two columns: ``uid``, ``item_id``.
+    Use this for the dislike post-merge filter so we don't suppress tracks
+    the user has explicitly reactivated.
+    """
+    last_dis = (
+        dislikes
+        .group_by(["uid", "item_id"])
+        .agg(pl.col("timestamp").max().alias("dislike_ts"))
+    )
+    last_undis = (
+        undislikes
+        .group_by(["uid", "item_id"])
+        .agg(pl.col("timestamp").max().alias("undislike_ts"))
+    )
+    return (
+        last_dis
+        .join(last_undis, on=["uid", "item_id"], how="left")
+        .filter(
+            pl.col("undislike_ts").is_null()
+            | (pl.col("dislike_ts") > pl.col("undislike_ts"))
+        )
+        .select(["uid", "item_id"])
+    )
+
+
 # ---------------------------------------------------------------------------
 # Format helpers
 # ---------------------------------------------------------------------------

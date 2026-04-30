@@ -23,7 +23,13 @@ import hydra
 import polars as pl
 from omegaconf import DictConfig, OmegaConf
 
-from src.data.dataset import load_dislikes, load_listens, positive_listens
+from src.data.dataset import (
+    effective_dislikes,
+    load_dislikes,
+    load_listens,
+    load_undislikes,
+    positive_listens,
+)
 from src.inference.merge_candidates import merge_candidates
 from src.inference.pipeline import (
     add_basic_features,
@@ -87,14 +93,20 @@ def main(cfg: DictConfig) -> None:
     merged = merge_candidates(cg_dfs)
 
     if cfg.filter_dislikes:
-        # Submission uses the full dislikes table — at inference time we know
-        # everything the user has disliked up to now.
+        # Submission uses the full event tables — at inference time we know
+        # every dislike (and every undislike that overrides it).
         dislikes = load_dislikes(path=cfg.data.dislikes)
-        before = len(merged)
-        merged = apply_exclude_filter(merged, dislikes)
+        undislikes = load_undislikes(path=cfg.data.undislikes)
+        active_dislikes = effective_dislikes(dislikes, undislikes)
         log.info(
-            "dislike filter (full): dropped %d / %d candidate rows; %d dislike pairs used",
-            before - len(merged), before, len(dislikes),
+            "effective dislikes (full): %d active / %d raw / %d undislikes",
+            len(active_dislikes), len(dislikes), len(undislikes),
+        )
+        before = len(merged)
+        merged = apply_exclude_filter(merged, active_dislikes)
+        log.info(
+            "dislike filter: dropped %d / %d candidate rows",
+            before - len(merged), before,
         )
 
     # ── 5. Features (computed on full listens) ───────────────────────────────
