@@ -35,6 +35,8 @@ class RankerModel:
         self._feature_cols = [c for c in df_train.columns if c not in _SKIP_COLS]
         log.info("fitting RankerModel: %d features, train=%d rows", len(self._feature_cols), len(df_train))
 
+        # CatBoostRanker requires query_ids to be contiguous per group.
+        df_train = df_train.sort("uid")
         train_pool = Pool(
             data=df_train[self._feature_cols].to_pandas(),
             label=df_train["label"].to_pandas(),
@@ -51,6 +53,7 @@ class RankerModel:
             thread_count=-1,
         )
         if df_val is not None:
+            df_val = df_val.sort("uid")
             val_pool = Pool(
                 data=df_val[self._feature_cols].to_pandas(),
                 label=df_val["label"].to_pandas(),
@@ -74,4 +77,21 @@ class RankerModel:
             .group_by("uid")
             .head(n)
             .select(["uid", "item_id", "ranker_score"])
+        )
+
+    def feature_importance(self, prettified: bool = True):
+        """CatBoost native PredictionValuesChange feature importance.
+
+        For ``YetiRank`` (and other ranking losses) CatBoost defaults to
+        ``LossFunctionChange``, which needs a Pool to compute. We force
+        ``PredictionValuesChange`` so the call works without refeeding data.
+
+        Returns a pandas DataFrame sorted descending by importance when
+        ``prettified=True``; otherwise an array aligned with feature order.
+        """
+        if self._model is None:
+            raise RuntimeError("RankerModel.feature_importance: model is not fitted yet")
+        return self._model.get_feature_importance(
+            type="PredictionValuesChange",
+            prettified=prettified,
         )

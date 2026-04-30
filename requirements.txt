@@ -12,5 +12,6 @@ torch==2.6.0
 tqdm==4.67.1
 transformers==4.51.3
 catboost==1.2.10
+faiss-cpu==1.8.0
 pytest==8.3.5
 optuna==4.3.0

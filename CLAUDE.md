@@ -11,8 +11,8 @@ uid,item_ids
 ```
 
 ## Архитектура решения
-Двухэтапная: **candidate generators** (~300-500/юзер) → **CatBoost Ranker** (top-100).
-Генераторы: DecayPop, ALS, BPR, LightFM, SASRec, GRU4Rec, ContentKNN.
+Двухэтапная: **candidate generators** (~600-800/юзер) → **CatBoost Ranker** (top-100).
+Активные генераторы: DecayPop, ALS (weighted), RepeatListen, ItemKNN, ArtistAlbumPop, AudioEmbedKNN, eSASRec.
 Подробный план и текущий прогресс: [docs/roadmap.md](docs/roadmap.md)
 
 ## Данные (Yambda)
@@ -36,25 +36,36 @@ uid,item_ids
 ## Структура репо
 ```
 configs/
-  data/           50m.yaml  500m.yaml
-  model/          pop.yaml ✅  user_pop.yaml ✅  als.yaml ✅
-  split/          temporal.yaml
-  train.yaml      evaluate.yaml  submit.yaml  ranker.yaml ✅
+  data/             50m.yaml  500m.yaml
+  model/            pop.yaml ✅  user_pop.yaml ✅  als.yaml ✅  repeat.yaml ✅
+                    itemknn.yaml (A2)  artist_pop.yaml (A2)  audio_knn.yaml (A3)
+  split/            temporal.yaml
+  train.yaml  evaluate.yaml  submit.yaml
+  ranker.yaml ✅            # multi-CG + ranker pipeline
+  submit_ranker.yaml ✅     # submission from saved ranker
 src/
-  data/           dataset.py ✅  splits.py ✅  preprocessing.py ✅  features.py (stub)
-  models/         base.py ✅  pop.py ✅  als.py ✅  catboost_ranker.py ✅
-                  lightfm.py (stub)  sasrec.py (stub)  gru4rec.py (stub)
-  evaluation/     metrics.py ✅  (recall_at_k)
-  inference/      merge_candidates.py (stub)
-  training/       trainer.py (stub)
-  utils/          logging.py ✅
-scripts/          train.py ✅  evaluate.py ✅  make_submission.py ✅
-                  train_ranker.py ✅  download_data.py ✅
-notebooks/        00_baseline.ipynb  01_eda.ipynb
-docs/             roadmap.md  dataset-description.md  data-dictionary.md  experiment-log.md
-submissions/      sub_XXX_name.csv  users.csv
-artifacts/        results.csv  (веса моделей — в .gitignore)
-data/             (gitignored) 50m/  500m/  5b/  embeddings.parquet
+  data/             dataset.py ✅  splits.py ✅  preprocessing.py ✅
+                    features.py (stub → A2/A3)
+  models/           base.py ✅  pop.py ✅  als.py ✅  repeat.py ✅
+                    catboost_ranker.py ✅  esasrec.py (stub → server)
+  evaluation/       metrics.py ✅
+  inference/        merge_candidates.py ✅
+  training/         cg_cache.py ✅
+  utils/            logging.py ✅
+scripts/            train.py ✅  evaluate.py ✅  make_submission.py ✅
+                    train_ranker.py ✅      # train multi-CG + ranker, NO submission
+                    submit_ranker.py ✅     # submission from saved ranker
+                    download_data.py ✅
+notebooks/          00_baseline.ipynb  01_eda.ipynb
+docs/               roadmap.md  dataset-description.md  data-dictionary.md  experiment-log.md
+submissions/        sub_XXX_name.csv  users.csv
+artifacts/          results.csv
+                    cg/{name}_{size}.pkl              # fitted on split.train
+                    cg/{name}_{size}_full.pkl         # fitted on full data
+                    ranker_{run_id}.pkl
+                    feature_importance_{run_id}.csv   # CatBoost native
+                    features/{run_id}_{split}.parquet # optional cache
+data/               (gitignored) 50m/  500m/  5b/  embeddings.parquet
 ```
 
 ## Команды
@@ -62,13 +73,17 @@ data/             (gitignored) 50m/  500m/  5b/  embeddings.parquet
 # Данные
 python scripts/download_data.py dataset_size=50m
 
-# Одиночная модель (кандидат-генератор)
+# Одиночная модель (кандидат-генератор) — для отладки
 python scripts/train.py model=als data=50m
 python scripts/evaluate.py model=als data=50m
 python scripts/make_submission.py model=als data=50m run_id=001
 
-# Полный пайплайн ALS → CatBoost Ranker (основной)
-python scripts/train_ranker.py data=50m run_id=002
+# Multi-CG → CatBoost Ranker (основной): train сначала, submit потом
+python scripts/train_ranker.py data=50m run_id=003
+python scripts/submit_ranker.py data=50m run_id=003
+
+# Принудительно переобучить все CG (игнорировать кэш)
+python scripts/train_ranker.py data=50m run_id=003 force_refit_cg=true
 
 # Тесты
 pytest tests/ -v
@@ -120,7 +135,13 @@ return (
 - НЕ менять валидационный сплит между экспериментами
 
 ## Known limitations
-- **Cold users**: ALS не знает юзеров без positive listens в train (~793/10k eval-юзеров). Они получают 0 предсказаний и тянут Recall вниз. Следующий шаг — добавить DecayPop fallback в `train_ranker.py` для cold users.
+- **Cold users**: ALS не знает юзеров без positive listens в train (~793/10k eval-юзеров). DecayPop в multi-CG пайплайне работает как fallback — он не требует истории.
+
+## Кэш кандидат-генераторов
+- Каждый CG, обученный через `train_ranker.py`, пиклится в `artifacts/cg/{name}_{size}.pkl`. При повторном запуске (например, ранкер с другими гиперпарамами) CG подгружается из кэша.
+- `submit_ranker.py` использует параллельный кэш с суффиксом `_full` — модели обучены на полных данных без сплита.
+- Принудительно переобучить: `force_refit_cg=true`.
+- Кэш нельзя переиспользовать между разными размерами данных — это явно отражено в имени файла.
 
 ## Внешние референсы
 - https://github.com/antklen/recsys_challenge_2025

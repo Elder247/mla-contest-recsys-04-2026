@@ -5,17 +5,49 @@ defaults:
 
 seed: 42
 top_k: 100
-output_dir: artifacts
-submission_dir: submissions
-run_id: "002"
+run_id: "003"
 
-als:
-  factors: 128
-  iterations: 20
-  regularization: 0.01
-  alpha: 40.0
-  n_cand: 500
-  random_state: 42
+# Set true to ignore cached CG pickles and refit from scratch.
+force_refit_cg: false
+
+# Optional cache for the merged feature table (LazyFrame sink_parquet).
+# Phase A2 wires this up; A1 ignores it.
+cache_features: false
+
+# CatBoost native feature_importance saved as artifacts/feature_importance_{run_id}.csv
+compute_feature_importance: true
+
+output_dir: artifacts        # results.csv, feature_importance_*.csv
+ranker_dir: artifacts        # ranker_{run_id}.pkl
+features_dir: artifacts/features
+cg_cache_dir: artifacts/cg
+
+# ── Candidate generators ─────────────────────────────────────────────────
+# Each entry is a Hydra-instantiable config. ``name`` becomes the CG's
+# ``self.name`` and drives the ``{name}_score`` / ``{name}_rank`` columns
+# emitted by merge_candidates.
+candidate_generators:
+  - _target_: src.models.pop.DecayPop
+    name: decaypop
+    n_cand: 100
+    half_life_units: 86400
+
+  - _target_: src.models.als.ALSModel
+    name: als
+    factors: 128
+    iterations: 20
+    regularization: 0.01
+    alpha: 40.0
+    n_cand: 500
+    high_engagement_weight: 3.0
+    mid_engagement_weight: 1.0
+    high_threshold: 80.0
+    random_state: 42
+
+  - _target_: src.models.repeat.RepeatListenModel
+    name: repeat
+    n_cand: 200
+    half_life_units: 86400
 
 ranker:
   iterations: 500

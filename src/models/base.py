@@ -4,7 +4,14 @@ import polars as pl
 
 
 class BaseModel(ABC):
-    """Abstract base class for all candidate generators."""
+    """Abstract base class for all candidate generators.
+
+    Convention: every concrete model has a `name` attribute (e.g. ``"als"``).
+    The merge_candidates utility uses this name to derive feature columns
+    ``{name}_score`` and ``{name}_rank`` in the merged candidates table.
+    """
+
+    name: str = "base"
 
     @abstractmethod
     def fit(self, train: pl.DataFrame, **kwargs) -> None:
@@ -28,6 +35,12 @@ class BaseModel(ABC):
             n: Maximum number of candidates per user.
 
         Returns:
-            DataFrame with columns: uid (Int64), item_id (Int64), score (Float64).
+            DataFrame with columns
+                uid: Int64
+                item_id: Int64
+                score: Float32 (or Float64)
+                {name}_rank: Int32 — 1-based rank within this CG for the user.
             Sorted by (uid, score desc). At most n rows per uid.
+            The {name}_rank column is mandatory: merge_candidates relies on
+            its presence to track per-CG ranks across the union of candidates.
         """

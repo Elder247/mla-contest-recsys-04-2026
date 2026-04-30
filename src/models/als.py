@@ -6,7 +6,11 @@ import polars as pl
 from implicit.als import AlternatingLeastSquares
 
 from src.data.dataset import positive_listens
-from src.data.preprocessing import build_id_maps, build_csr_matrix
+from src.data.preprocessing import (
+    add_engagement_weights,
+    build_csr_matrix,
+    build_id_maps,
+)
 from src.models.base import BaseModel
 
 log = logging.getLogger(__name__)
@@ -17,6 +21,10 @@ class ALSModel(BaseModel):
 
     recommend() returns (uid, item_id, score, als_rank) — the extra column
     is used as a ranker feature downstream.
+
+    Engagement weights: rows with played_ratio_pct > high_threshold get
+    ``high_engagement_weight`` confidence; lower-engagement listens get
+    ``mid_engagement_weight``. Set both to 1.0 to fall back to binary.
     """
 
     def __init__(
@@ -27,6 +35,9 @@ class ALSModel(BaseModel):
         regularization: float = 0.01,
         alpha: float = 40.0,
         n_cand: int = 500,
+        high_engagement_weight: float = 3.0,
+        mid_engagement_weight: float = 1.0,
+        high_threshold: float = 80.0,
         random_state: int = 42,
     ):
         self.name = name
@@ -35,6 +46,9 @@ class ALSModel(BaseModel):
         self.regularization = regularization
         self.alpha = alpha
         self.n_cand = n_cand
+        self.high_engagement_weight = high_engagement_weight
+        self.mid_engagement_weight = mid_engagement_weight
+        self.high_threshold = high_threshold
         self.random_state = random_state
 
         self._model: AlternatingLeastSquares | None = None
@@ -46,11 +60,25 @@ class ALSModel(BaseModel):
     def fit(self, train: pl.DataFrame, **kwargs) -> None:
         pos = positive_listens(train)
         uid_map, item_map, _, inv_item_map = build_id_maps(pos)
-        matrix = build_csr_matrix(pos, uid_map, item_map)
+
+        weighted = self.high_engagement_weight != self.mid_engagement_weight
+        if weighted:
+            pos = add_engagement_weights(
+                pos,
+                high=self.high_engagement_weight,
+                mid=self.mid_engagement_weight,
+                high_threshold=self.high_threshold,
+            )
+            matrix = build_csr_matrix(pos, uid_map, item_map, weight_col="weight")
+        else:
+            matrix = build_csr_matrix(pos, uid_map, item_map)
 
         log.info(
-            "fitting ALS: users=%d items=%d factors=%d iters=%d alpha=%.1f",
+            "fitting ALS: users=%d items=%d factors=%d iters=%d alpha=%.1f weighted=%s "
+            "(high=%.2f mid=%.2f thr=%.1f)",
             len(uid_map), len(item_map), self.factors, self.iterations, self.alpha,
+            weighted, self.high_engagement_weight, self.mid_engagement_weight,
+            self.high_threshold,
         )
         model = AlternatingLeastSquares(
             factors=self.factors,
@@ -77,7 +105,7 @@ class ALSModel(BaseModel):
                     "uid": pl.Int64,
                     "item_id": pl.Int64,
                     "score": pl.Float32,
-                    "als_rank": pl.Int32
+                    "als_rank": pl.Int32,
                 }
             )
 

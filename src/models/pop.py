@@ -19,8 +19,14 @@ _DEFAULT_HALF_LIFE = 86_400
 class DecayPop(BaseModel):
     """Global popularity ranking with exponential decay. Same list for all users."""
 
-    def __init__(self, name: str = "pop", half_life_units: int = _DEFAULT_HALF_LIFE):
+    def __init__(
+        self,
+        name: str = "pop",
+        n_cand: int = 100,
+        half_life_units: int = _DEFAULT_HALF_LIFE,
+    ):
         self.name = name
+        self.n_cand = n_cand
         self.half_life_units = half_life_units
         self._item_scores: pl.DataFrame | None = None
 
@@ -47,12 +53,19 @@ class DecayPop(BaseModel):
         log.info("DecayPop fitted: %d unique items", len(self._item_scores))
 
     def recommend(self, users: list[int], n: int = 100, **kwargs) -> pl.DataFrame:
-        top = self._item_scores.head(n)
+        rank_col = f"{self.name}_rank"
+        top = (
+            self._item_scores
+            .head(n)
+            .with_columns(
+                pl.int_range(1, pl.len() + 1, dtype=pl.Int32).alias(rank_col)
+            )
+        )
         users_df = pl.DataFrame({"uid": users}).with_columns(pl.col("uid").cast(pl.Int64))
         return (
             users_df
             .join(top, how="cross")
-            .select(["uid", "item_id", "score"])
+            .select(["uid", "item_id", "score", rank_col])
         )
 
 
@@ -62,10 +75,12 @@ class UserPersonalPop(BaseModel):
     def __init__(
         self,
         name: str = "user_pop",
+        n_cand: int = 100,
         half_life_units: int = _DEFAULT_HALF_LIFE,
         candidates_pool: int = 500,
     ):
         self.name = name
+        self.n_cand = n_cand
         self.half_life_units = half_life_units
         self.candidates_pool = candidates_pool
         self._item_scores: pl.DataFrame | None = None
@@ -104,6 +119,7 @@ class UserPersonalPop(BaseModel):
                  len(self._item_scores), len(self._seen_df))
 
     def recommend(self, users: list[int], n: int = 100, **kwargs) -> pl.DataFrame:
+        rank_col = f"{self.name}_rank"
         pool = self._item_scores.head(self.candidates_pool)
         users_df = pl.DataFrame({"uid": users}).with_columns(pl.col("uid").cast(pl.Int64))
         return (
@@ -111,7 +127,10 @@ class UserPersonalPop(BaseModel):
             .join(pool, how="cross")
             .join(self._seen_df, on=["uid", "item_id"], how="anti")
             .sort(["uid", "score"], descending=[False, True])
-            .group_by("uid")
+            .group_by("uid", maintain_order=True)
             .head(n)
-            .select(["uid", "item_id", "score"])
+            .with_columns(
+                pl.int_range(1, pl.len() + 1, dtype=pl.Int32).over("uid").alias(rank_col)
+            )
+            .select(["uid", "item_id", "score", rank_col])
         )

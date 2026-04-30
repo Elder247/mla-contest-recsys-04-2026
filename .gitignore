@@ -1,5 +1,6 @@
 # данные и веса (большие файлы)
 /data/
+artifacts/cg/
 artifacts/*.pt
 artifacts/*.pkl
 artifacts/*.cbm

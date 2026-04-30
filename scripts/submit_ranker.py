@@ -1,0 +1,109 @@
+"""Generate a submission from a trained ranker.
+
+Reuses the ranker pickle from a prior ``train_ranker.py`` run (matched by
+``run_id``) and either reuses or fits each CG on the *full* listens data
+(suffix ``_full`` in the cg cache).
+
+Steps:
+  1. Load full listens (no split).
+  2. Load ranker from artifacts/ranker_{run_id}.pkl.
+  3. For each CG: fit_or_load_cg(..., suffix="_full") on full data.
+  4. Generate candidates for all 10k eval users → merge.
+  5. Add features (same as train_ranker — basic features in A1).
+  6. ranker.predict → top-100 → submission CSV.
+
+Usage:
+    python scripts/submit_ranker.py data=50m run_id=003
+"""
+import logging
+import pickle
+from pathlib import Path
+
+import hydra
+import polars as pl
+from omegaconf import DictConfig, OmegaConf
+
+from src.data.dataset import load_listens, positive_listens
+from src.inference.merge_candidates import merge_candidates
+from src.inference.pipeline import (
+    add_basic_features,
+    generate_candidates,
+    load_eval_users,
+)
+from src.training.cg_cache import fit_or_load_cg
+from src.utils import setup_logging
+
+log = logging.getLogger(__name__)
+
+
+def _format_submission(preds: pl.DataFrame, top_k: int) -> pl.DataFrame:
+    score_col = "ranker_score" if "ranker_score" in preds.columns else "score"
+    return (
+        preds
+        .sort(["uid", score_col], descending=[False, True])
+        .group_by("uid", maintain_order=True)
+        .head(top_k)
+        .group_by("uid")
+        .agg(pl.col("item_id").cast(pl.Utf8).str.join(delimiter=" ").alias("item_ids"))
+        .sort("uid")
+    )
+
+
+@hydra.main(config_path="../configs", config_name="submit_ranker", version_base="1.3")
+def main(cfg: DictConfig) -> None:
+    setup_logging()
+    log.info("config:\n%s", OmegaConf.to_yaml(cfg))
+
+    # ── 1. Load full data ────────────────────────────────────────────────────
+    log.info("loading listens from %s", cfg.data.listens)
+    listens = positive_listens(load_listens(path=cfg.data.listens))
+    log.info("positive listens (full): %d rows", len(listens))
+
+    eval_users = load_eval_users(cfg.data.users_csv)
+    log.info("eval users: %d", len(eval_users))
+
+    # ── 2. Load trained ranker ───────────────────────────────────────────────
+    run_id = str(cfg.run_id)
+    ranker_path = Path(cfg.ranker_dir) / f"ranker_{run_id}.pkl"
+    log.info("loading ranker from %s", ranker_path)
+    with open(ranker_path, "rb") as f:
+        ranker = pickle.load(f)
+
+    # ── 3. Fit / load each CG on FULL data (suffix="_full") ──────────────────
+    cgs = []
+    for cg_cfg in cfg.candidate_generators:
+        cg = fit_or_load_cg(
+            cg_cfg,
+            listens,
+            size=cfg.data.size,
+            suffix="_full",
+            force_refit=cfg.force_refit_cg,
+        )
+        cgs.append(cg)
+
+    # ── 4. Generate candidates → merge ───────────────────────────────────────
+    cg_dfs = generate_candidates(cgs, eval_users)
+    merged = merge_candidates(cg_dfs)
+
+    # ── 5. Features (computed on full listens) ───────────────────────────────
+    feats = add_basic_features(merged, listens)
+
+    # ── 6. Rank + format submission ──────────────────────────────────────────
+    preds = ranker.predict(feats, n=cfg.top_k)
+    submission = _format_submission(preds, top_k=cfg.top_k)
+    log.info("submission rows: %d", len(submission))
+
+    missing = set(eval_users) - set(submission["uid"].cast(pl.Int64).to_list())
+    if missing:
+        log.warning("%d eval users have no predictions (cold users)", len(missing))
+
+    sub_dir = Path(cfg.submission_dir)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = sub_dir / f"sub_{run_id}_{cfg.submission_name}.csv"
+    submission.write_csv(archive_path)
+    submission.write_csv(sub_dir / "test.csv")
+    log.info("submission saved to %s and %s", archive_path, sub_dir / "test.csv")
+
+
+if __name__ == "__main__":
+    main()

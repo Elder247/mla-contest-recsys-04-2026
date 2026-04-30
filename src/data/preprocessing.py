@@ -1,4 +1,4 @@
-"""Shared preprocessing utilities for CF models (ALS, BPR, LightFM)."""
+"""Shared preprocessing utilities for CF models (ALS, ItemKNN)."""
 import numpy as np
 import polars as pl
 from scipy.sparse import csr_matrix
@@ -26,22 +26,51 @@ def build_id_maps(
     return uid_map, item_map, inv_uid_map, inv_item_map
 
 
+def add_engagement_weights(
+    df: pl.DataFrame,
+    high: float = 3.0,
+    mid: float = 1.0,
+    high_threshold: float = 80.0,
+    weight_col: str = "weight",
+) -> pl.DataFrame:
+    """Append a per-row interaction weight derived from played_ratio_pct.
+
+    played_ratio_pct > high_threshold → ``high`` weight (typically 3.0)
+    50 < played_ratio_pct ≤ high_threshold → ``mid`` weight (typically 1.0)
+
+    Caller is responsible for filtering to positive listens beforehand.
+    """
+    return df.with_columns(
+        pl.when(pl.col("played_ratio_pct") > high_threshold)
+        .then(pl.lit(high, dtype=pl.Float32))
+        .otherwise(pl.lit(mid, dtype=pl.Float32))
+        .alias(weight_col)
+    )
+
+
 def build_csr_matrix(
     df: pl.DataFrame,
     uid_map: dict,
     item_map: dict,
     user_col: str = "uid",
     item_col: str = "item_id",
+    weight_col: str | None = None,
 ) -> csr_matrix:
-    """Build a binary user-item interaction matrix.
+    """Build a user-item interaction matrix.
 
-    All observed interactions get value 1.0.
+    If ``weight_col`` is given, that column drives the matrix values.
+    Otherwise all observed interactions get value 1.0 (binary).
+
     The implicit library scales confidence as C = 1 + alpha * matrix,
-    so alpha controls engagement strength.
+    so non-uniform weights translate into per-interaction confidence.
+    Duplicate (user, item) rows are summed by scipy's COO→CSR conversion.
     """
     rows = np.array([uid_map[u] for u in df[user_col].to_list()], dtype=np.int32)
     cols = np.array([item_map[it] for it in df[item_col].to_list()], dtype=np.int32)
-    data = np.ones(len(rows), dtype=np.float32)
+    if weight_col is None:
+        data = np.ones(len(rows), dtype=np.float32)
+    else:
+        data = df[weight_col].to_numpy().astype(np.float32)
     return csr_matrix(
         (data, (rows, cols)),
         shape=(len(uid_map), len(item_map)),

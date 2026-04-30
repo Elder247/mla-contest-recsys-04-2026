@@ -1,0 +1,12 @@
+defaults:
+  - ranker            # inherit candidate_generators, ranker block, top_k, run_id, dirs
+  - _self_
+
+# Override-able from CLI.
+submission_dir: submissions
+submission_name: ranker
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
