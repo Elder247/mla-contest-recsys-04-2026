@@ -9,14 +9,14 @@ Steps:
   2. For each CG in cfg.candidate_generators: fit_or_load_cg (cache lookup).
   3. Generate ``cg.n_cand`` candidates per eval user from each CG.
   4. merge_candidates → cg_recall (upper bound for the ranker).
-  5. add_features (basic features for now; A2 will swap in features.py).
+  5. add_features (LazyFrame-based: ~48 user/item/pair/cross features).
   6. Label vs val ground truth, GroupShuffleSplit 80/20, fit CatBoost YetiRank.
   7. Recall@100 on val + test → experiment-log.md + artifacts/results.csv.
   8. Pickle ranker → artifacts/ranker_{run_id}.pkl.
   9. Optional CatBoost feature importance → artifacts/feature_importance_{run_id}.csv.
 
 Usage:
-    python scripts/train_ranker.py data=50m run_id=003
+    python scripts/train_ranker.py data=50m run_id=006
 """
 import csv
 import logging
@@ -38,11 +38,11 @@ from src.data.dataset import (
     load_undislikes,
     positive_listens,
 )
+from src.data.features import add_features
 from src.data.splits import temporal_split
 from src.evaluation.metrics import recall_at_k
 from src.inference.merge_candidates import cg_recall, merge_candidates
 from src.inference.pipeline import (
-    add_basic_features,
     apply_exclude_filter,
     generate_candidates,
     load_eval_users,
@@ -181,14 +181,46 @@ def main(cfg: DictConfig) -> None:
     upper_bound = cg_recall(merged, gt_val)
     log.info("CG-recall@∞ on val (upper bound for ranker, ×1000 scale): %.2f", upper_bound)
 
-    # ── 5. Label + features ──────────────────────────────────────────────────
+    # ── 5. Label + features (LazyFrame, train period only via cutoff_ts) ─────
     labeled = _label_candidates(merged, gt_val)
-    labeled = add_basic_features(labeled, split.train)
     pos_rate = float(labeled["label"].mean())
     log.info(
         "label rate: %.4f (neg_ratio ~%d:1, %d rows)",
         pos_rate, int(1 / pos_rate) if pos_rate > 0 else 0, len(labeled),
     )
+
+    cutoff_ts = int(train_max_ts)
+    listens_lf = pl.scan_parquet(cfg.data.listens)
+    likes_lf = pl.scan_parquet(cfg.data.likes)
+    dislikes_lf = pl.scan_parquet(cfg.data.dislikes)
+    unlikes_lf = pl.scan_parquet(cfg.data.unlikes)
+    undislikes_lf = pl.scan_parquet(cfg.data.undislikes)
+    artist_map_lf = pl.scan_parquet(cfg.data.artist_item_mapping)
+    album_map_lf = pl.scan_parquet(cfg.data.album_item_mapping)
+
+    log.info("computing features (LazyFrame, cutoff_ts=%d)", cutoff_ts)
+    features_lf = add_features(
+        labeled.lazy(),
+        listens_lf=listens_lf,
+        likes_lf=likes_lf,
+        dislikes_lf=dislikes_lf,
+        unlikes_lf=unlikes_lf,
+        undislikes_lf=undislikes_lf,
+        artist_map_lf=artist_map_lf,
+        album_map_lf=album_map_lf,
+        cutoff_ts=cutoff_ts,
+    )
+
+    if cfg.cache_features:
+        features_dir = Path(cfg.features_dir)
+        features_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = features_dir / f"{cfg.run_id}_train.parquet"
+        log.info("caching features → %s", cache_path)
+        features_lf.sink_parquet(str(cache_path), compression="zstd")
+        labeled = pl.scan_parquet(str(cache_path)).collect()
+    else:
+        labeled = features_lf.collect()
+    log.info("labeled+features: %d rows × %d cols", len(labeled), len(labeled.columns))
 
     # ── 6. Train ranker ──────────────────────────────────────────────────────
     df_train, df_val_ranker = _split_for_ranker(labeled, cfg.seed)
@@ -202,7 +234,20 @@ def main(cfg: DictConfig) -> None:
     merged_full = merge_candidates(cg_dfs_full)
     if cfg.filter_dislikes:
         merged_full = apply_exclude_filter(merged_full, active_dislikes)
-    feats_full = add_basic_features(merged_full, split.train)
+    log.info("computing features for full eval set")
+    feats_full_lf = add_features(
+        merged_full.lazy(),
+        listens_lf=listens_lf,
+        likes_lf=likes_lf,
+        dislikes_lf=dislikes_lf,
+        unlikes_lf=unlikes_lf,
+        undislikes_lf=undislikes_lf,
+        artist_map_lf=artist_map_lf,
+        album_map_lf=album_map_lf,
+        cutoff_ts=cutoff_ts,
+    )
+    feats_full = feats_full_lf.collect()
+    log.info("full eval features: %d rows × %d cols", len(feats_full), len(feats_full.columns))
 
     preds_val = ranker.predict(feats_full, n=cfg.top_k)
     score_val = recall_at_k(gt_val, preds_val, k=cfg.top_k)

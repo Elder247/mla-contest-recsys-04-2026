@@ -31,9 +31,9 @@ from src.data.dataset import (
     load_undislikes,
     positive_listens,
 )
+from src.data.features import add_features
 from src.inference.merge_candidates import merge_candidates
 from src.inference.pipeline import (
-    add_basic_features,
     apply_exclude_filter,
     generate_candidates,
     load_eval_users,
@@ -125,8 +125,30 @@ def main(cfg: DictConfig) -> None:
             before - len(merged), before,
         )
 
-    # ── 5. Features (computed on full listens) ───────────────────────────────
-    feats = add_basic_features(merged, listens)
+    # ── 5. Features (LazyFrame, full data — cutoff_ts = max ts) ─────────────
+    listens_lf = pl.scan_parquet(cfg.data.listens)
+    likes_lf = pl.scan_parquet(cfg.data.likes)
+    dislikes_lf = pl.scan_parquet(cfg.data.dislikes)
+    unlikes_lf = pl.scan_parquet(cfg.data.unlikes)
+    undislikes_lf = pl.scan_parquet(cfg.data.undislikes)
+    artist_map_lf = pl.scan_parquet(cfg.data.artist_item_mapping)
+    album_map_lf = pl.scan_parquet(cfg.data.album_item_mapping)
+
+    cutoff_ts = int(listens["timestamp"].max())
+    log.info("computing features (LazyFrame, cutoff_ts=%d, full data)", cutoff_ts)
+    feats_lf = add_features(
+        merged.lazy(),
+        listens_lf=listens_lf,
+        likes_lf=likes_lf,
+        dislikes_lf=dislikes_lf,
+        unlikes_lf=unlikes_lf,
+        undislikes_lf=undislikes_lf,
+        artist_map_lf=artist_map_lf,
+        album_map_lf=album_map_lf,
+        cutoff_ts=cutoff_ts,
+    )
+    feats = feats_lf.collect()
+    log.info("submission features: %d rows × %d cols", len(feats), len(feats.columns))
 
     # ── 6. Rank + format submission ──────────────────────────────────────────
     preds = ranker.predict(feats, n=cfg.top_k)

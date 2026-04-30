@@ -38,18 +38,20 @@ uid,item_ids
 configs/
   data/             50m.yaml  500m.yaml
   model/            pop.yaml ✅  user_pop.yaml ✅  als.yaml ✅  repeat.yaml ✅
-                    itemknn.yaml (A2)  artist_pop.yaml (A2)  audio_knn.yaml (A3)
+                    itemknn.yaml ✅  artist_pop.yaml ✅  recent_likes.yaml ✅
+                    audio_knn.yaml (A3)
   split/            temporal.yaml
   train.yaml  evaluate.yaml  submit.yaml
   ranker.yaml ✅            # multi-CG + ranker pipeline
   submit_ranker.yaml ✅     # submission from saved ranker
 src/
   data/             dataset.py ✅  splits.py ✅  preprocessing.py ✅
-                    features.py (stub → A2/A3)
+                    features.py (stub → A2.2)
   models/           base.py ✅  pop.py ✅  als.py ✅  repeat.py ✅
+                    itemknn.py ✅  artist_pop.py ✅  recent_likes.py ✅
                     catboost_ranker.py ✅  esasrec.py (stub → server)
   evaluation/       metrics.py ✅
-  inference/        merge_candidates.py ✅
+  inference/        merge_candidates.py ✅  pipeline.py ✅
   training/         cg_cache.py ✅
   utils/            logging.py ✅
 scripts/            train.py ✅  evaluate.py ✅  make_submission.py ✅
@@ -113,6 +115,18 @@ return (
 )
 ```
 - Type hints на все функции; `logging` вместо `print`
+
+### Lazy / streaming для feature engineering (масштаб 500m / 5B)
+Все агрегаты пользователя/айтема/пары в `src/data/features.py` пишем как `pl.LazyFrame` chains. Правила:
+
+1. **Загрузка**: `pl.scan_parquet(path)` (не `read_parquet`) — Polars пушит filter+projection в parquet reader, экономит RAM.
+2. **Predicate pushdown через cutoff_ts**: фичестроители принимают `cutoff_ts: int`; внутри `lf.filter(pl.col("timestamp") <= cutoff_ts)`.
+3. **Pair-features filter pushdown**: перед `group_by(["uid","item_id"])` делать `lf.join(candidates.select(["uid","item_id"]), on=..., how="semi")`. На 5B это разница между OK и OOM.
+4. **Materialization**: `.collect(streaming=True)` или `.sink_parquet()` (для кэша) — никаких `.collect()` без streaming на больших данных.
+5. **Type discipline**: `Int32` для счётчиков (или UInt32 на 5B), `Float32` для ratios, финальный `.shrink_dtype()` опц.
+6. **Fold через left-join**: `add_features` orchestrator делает последовательные `.join(..., how="left")` — Polars optimizer фьюзит цепочку.
+
+Не материализуем промежуточные DataFrame'ы. CatBoost Pool принимает только pandas/numpy → `.collect()` делаем один раз перед fit/predict.
 
 ## Валидация
 Темпоральный сплит: `temporal_split(df, val_days=7, gap_days=1)` — реализован в `src/data/splits.py`.

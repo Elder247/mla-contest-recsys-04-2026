@@ -1,9 +1,8 @@
 """Shared helpers for the multi-CG ranker pipeline.
 
 Used by both ``scripts/train_ranker.py`` (offline train + eval) and
-``scripts/submit_ranker.py`` (submission generation). Phase A1 keeps the
-feature set minimal — A2 will swap ``add_basic_features`` for the rich
-LazyFrame implementation in ``src/data/features.py``.
+``scripts/submit_ranker.py`` (submission generation). Feature engineering
+itself lives in ``src/data/features.py`` (LazyFrame-based).
 """
 from __future__ import annotations
 
@@ -57,39 +56,4 @@ def apply_exclude_filter(
         ]).unique(),
         on=["uid", "item_id"],
         how="anti",
-    )
-
-
-def add_basic_features(candidates: pl.DataFrame, train: pl.DataFrame) -> pl.DataFrame:
-    """Phase A1 placeholder — joins user_n_listens + item_pop only.
-
-    A2 will replace this with the LazyFrame-based ``add_features`` from
-    ``src/data/features.py`` (~50 features).
-    """
-    user_feats = (
-        train
-        .group_by("uid")
-        .agg(pl.len().alias("user_n_listens"))
-        .with_columns([
-            pl.col("uid").cast(pl.Int64),
-            pl.col("user_n_listens").cast(pl.Int32),
-        ])
-    )
-    item_feats = (
-        train
-        .group_by("item_id")
-        .agg(pl.len().alias("item_pop"))
-        .with_columns([
-            pl.col("item_id").cast(pl.Int64),
-            pl.col("item_pop").cast(pl.Int32),
-        ])
-    )
-    return (
-        candidates
-        .join(user_feats, on="uid", how="left")
-        .join(item_feats, on="item_id", how="left")
-        .with_columns([
-            pl.col("user_n_listens").fill_null(0).cast(pl.Int32),
-            pl.col("item_pop").fill_null(0).cast(pl.Int32),
-        ])
     )
