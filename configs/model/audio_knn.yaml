@@ -1,0 +1,7 @@
+_target_: src.models.audio_knn.AudioEmbedKNNModel
+name: audio_knn
+n_cand: 100
+user_history_k: 20
+hnsw_m: 32
+ef_construction: 200
+ef_search: 64

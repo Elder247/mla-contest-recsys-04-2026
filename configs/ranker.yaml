@@ -5,7 +5,7 @@ defaults:
 
 seed: 42
 top_k: 100
-run_id: "007"
+run_id: "008"
 
 # Set true to ignore cached CG pickles and refit from scratch.
 force_refit_cg: false
@@ -81,6 +81,14 @@ candidate_generators:
     n_cand: 100
     half_life_units: 518400
     data_source: likes
+
+  - _target_: src.models.audio_knn.AudioEmbedKNNModel
+    name: audio_knn
+    n_cand: 100
+    user_history_k: 20
+    hnsw_m: 32
+    ef_construction: 200
+    ef_search: 64
 
 ranker:
   iterations: 2000
