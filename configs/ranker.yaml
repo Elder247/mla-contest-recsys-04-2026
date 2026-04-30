@@ -90,6 +90,23 @@ candidate_generators:
     ef_construction: 200
     ef_search: 64
 
+  # eSASRec — sequential SOTA. Disabled locally (heavy training);
+  # uncomment on server (Phase C) and tune hyperparams via Optuna.
+  # - _target_: src.models.esasrec.ESASRecModel
+  #   name: esasrec
+  #   n_cand: 200
+  #   emb_dim: 256
+  #   n_blocks: 2
+  #   n_heads: 4
+  #   dropout: 0.2
+  #   sequence_max_len: 200
+  #   n_negatives: 256
+  #   max_epochs: 100
+  #   lr: 0.001
+  #   batch_size: 128
+  #   device: auto
+  #   random_state: 42
+
 ranker:
   iterations: 2000
   depth: 6
