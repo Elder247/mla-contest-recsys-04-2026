@@ -215,7 +215,7 @@ def main(cfg: DictConfig) -> None:
         features_dir = Path(cfg.features_dir)
         features_dir.mkdir(parents=True, exist_ok=True)
         cache_path = features_dir / f"{cfg.run_id}_train.parquet"
-        log.info("caching features → %s", cache_path)
+        log.info("caching labeled features → %s", cache_path)
         features_lf.sink_parquet(str(cache_path), compression="zstd")
         labeled = pl.scan_parquet(str(cache_path)).collect()
     else:
@@ -246,7 +246,15 @@ def main(cfg: DictConfig) -> None:
         album_map_lf=album_map_lf,
         cutoff_ts=cutoff_ts,
     )
-    feats_full = feats_full_lf.collect()
+    if cfg.cache_features:
+        features_dir = Path(cfg.features_dir)
+        features_dir.mkdir(parents=True, exist_ok=True)
+        eval_cache_path = features_dir / f"{cfg.run_id}_eval.parquet"
+        log.info("caching eval features → %s", eval_cache_path)
+        feats_full_lf.sink_parquet(str(eval_cache_path), compression="zstd")
+        feats_full = pl.scan_parquet(str(eval_cache_path)).collect()
+    else:
+        feats_full = feats_full_lf.collect()
     log.info("full eval features: %d rows × %d cols", len(feats_full), len(feats_full.columns))
 
     preds_val = ranker.predict(feats_full, n=cfg.top_k)

@@ -1,0 +1,41 @@
+defaults:
+  - data: 50m
+  - split: temporal
+  - _self_
+
+seed: 42
+
+# Which surface to tune: cg | ranker | n_cand
+phase: ranker
+
+# Common
+n_trials: 50
+storage_dir: artifacts/optuna           # sqlite storage will go here
+study_name: ${phase}                     # default; override per-run for parallel studies
+top_k: 100                               # contest k
+run_id: "008"                            # used to locate cached features / ranker pkl
+
+# ── phase=cg ──────────────────────────────────────────────────────────────
+# CG class is selected by ``cg_name`` (must match one of the supported builders
+# in scripts/tune.py: decaypop, repeat, recent_likes, als, itemknn,
+# artist_pop, album_pop, audio_knn).
+cg_name: decaypop
+data_source: listens                     # "listens" or "likes" (RecentLikes uses likes)
+n_max: 500                               # top-N for the standalone Recall@N_max metric
+
+# ── phase=ranker ──────────────────────────────────────────────────────────
+# Cached feature parquets produced by train_ranker.py with cache_features=true.
+labeled_features_path: artifacts/features/${run_id}_train.parquet
+eval_features_path: artifacts/features/${run_id}_eval.parquet
+
+# ── phase=n_cand ──────────────────────────────────────────────────────────
+ranker_path: artifacts/ranker_${run_id}.pkl
+n_max_per_cg: 500
+total_budget: 1500
+budget_step: 25
+cg_names_list: [decaypop, als, repeat, itemknn, artist_pop, album_pop, recent_likes, audio_knn]
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
