@@ -26,6 +26,7 @@ from omegaconf import DictConfig, OmegaConf
 from src.data.dataset import (
     effective_dislikes,
     load_dislikes,
+    load_likes,
     load_listens,
     load_undislikes,
     positive_listens,
@@ -77,11 +78,26 @@ def main(cfg: DictConfig) -> None:
         ranker = pickle.load(f)
 
     # ── 3. Fit / load each CG on FULL data (suffix="_full") ──────────────────
+    # Route by data_source: listens (default) or likes.
+    likes = load_likes(path=cfg.data.likes)
+    log.info("likes (full): %d rows", len(likes))
+
+    data_sources = {
+        "listens": listens,
+        "likes": likes,
+    }
+
     cgs = []
     for cg_cfg in cfg.candidate_generators:
+        source_name = cg_cfg.get("data_source", "listens")
+        if source_name not in data_sources:
+            raise ValueError(
+                f"unknown data_source '{source_name}' for CG '{cg_cfg.get('name')}'; "
+                f"valid: {list(data_sources)}"
+            )
         cg = fit_or_load_cg(
             cg_cfg,
-            listens,
+            data_sources[source_name],
             size=cfg.data.size,
             suffix="_full",
             force_refit=cfg.force_refit_cg,

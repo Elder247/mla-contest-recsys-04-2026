@@ -1,0 +1,4 @@
+_target_: src.models.itemknn.ItemKNNModel
+name: itemknn
+k: 200
+n_cand: 200

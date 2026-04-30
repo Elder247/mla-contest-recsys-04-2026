@@ -1,0 +1,4 @@
+_target_: src.models.recent_likes.RecentLikesModel
+name: recent_likes
+n_cand: 100
+half_life_units: 86400

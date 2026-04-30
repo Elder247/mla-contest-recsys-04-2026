@@ -33,6 +33,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from src.data.dataset import (
     effective_dislikes,
     load_dislikes,
+    load_likes,
     load_listens,
     load_undislikes,
     positive_listens,
@@ -116,11 +117,31 @@ def main(cfg: DictConfig) -> None:
     )
 
     # ── 2. Fit / load each CG ────────────────────────────────────────────────
+    # Some CGs (e.g. RecentLikesModel) train on likes, not listens.
+    # cg_cfg.data_source picks which source they get; default = listens.
+    train_max_ts = float(split.train["timestamp"].max())
+    likes_train = (
+        load_likes(path=cfg.data.likes)
+        .filter(pl.col("timestamp") <= train_max_ts)
+    )
+    log.info("likes (train period): %d rows", len(likes_train))
+
+    data_sources = {
+        "listens": split.train,
+        "likes": likes_train,
+    }
+
     cgs = []
     for cg_cfg in cfg.candidate_generators:
+        source_name = cg_cfg.get("data_source", "listens")
+        if source_name not in data_sources:
+            raise ValueError(
+                f"unknown data_source '{source_name}' for CG '{cg_cfg.get('name')}'; "
+                f"valid: {list(data_sources)}"
+            )
         cg = fit_or_load_cg(
             cg_cfg,
-            split.train,
+            data_sources[source_name],
             size=cfg.data.size,
             suffix="",
             force_refit=cfg.force_refit_cg,
@@ -135,9 +156,8 @@ def main(cfg: DictConfig) -> None:
     merged = merge_candidates(cg_dfs)
 
     if cfg.filter_dislikes:
-        # Use only events recorded up to the train cutoff to avoid leaking
-        # validation-period information into the offline eval.
-        train_max_ts = float(split.train["timestamp"].max())
+        # Use only events recorded up to the train cutoff (computed above)
+        # to avoid leaking validation-period information into the offline eval.
         dislikes_train = (
             load_dislikes(path=cfg.data.dislikes)
             .filter(pl.col("timestamp") <= train_max_ts)

@@ -14,11 +14,16 @@ from pathlib import Path
 
 import polars as pl
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from src.models.base import BaseModel
 
 log = logging.getLogger(__name__)
+
+# Keys that live alongside model __init__ args in candidate-generator yamls
+# but are pipeline-level metadata, not model parameters. Stripped before
+# Hydra instantiate so the model class doesn't see them as kwargs.
+_META_KEYS = {"data_source"}
 
 
 def cg_cache_path(
@@ -71,7 +76,11 @@ def fit_or_load_cg(
 
     log.info("fitting CG '%s' (cache %s, force_refit=%s)",
              name, "miss" if not path.exists() else "ignored", force_refit)
-    cg: BaseModel = instantiate(cg_cfg)
+    cfg_for_init = OmegaConf.create({
+        k: v for k, v in OmegaConf.to_container(cg_cfg, resolve=True).items()
+        if k not in _META_KEYS
+    })
+    cg: BaseModel = instantiate(cfg_for_init)
     cg.fit(train_df)
 
     path.parent.mkdir(parents=True, exist_ok=True)
