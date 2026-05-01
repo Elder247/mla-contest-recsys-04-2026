@@ -28,14 +28,14 @@ export PYTHONPATH=$(pwd)
 
 Install. CUDA torch first, then the rest:
 ```bash
-pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.6.0
+pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.0
 pip install -r requirements.txt
 ```
 
 Download 50m data to persistent disk
 ```bash
 mkdir -p ~/dc-remote/{data,artifacts}
-python3 -u scripts/download_data.py +dataset_size=50m data.root=/home/astrofimuk/dc-remote/data model=pop
+python3 -u scripts/download_data.py data=50m data.root=/home/astrofimuk/dc-remote/data model=pop
 ```
 
 Verify the install
