@@ -10,6 +10,7 @@ The same class serves both ``artist`` and ``album`` granularity via the
 instantiate it with different names + entity values.
 """
 import logging
+from pathlib import Path
 from typing import Literal
 
 import polars as pl
@@ -39,6 +40,7 @@ class ArtistAlbumPopModel(BaseModel):
         top_entities: int = 10,
         n_cand: int = 100,
         half_life_units: int = _DEFAULT_HALF_LIFE,
+        data_root: str = "data",
     ):
         if entity not in ("artist", "album"):
             raise ValueError(f"entity must be 'artist' or 'album', got {entity!r}")
@@ -47,6 +49,7 @@ class ArtistAlbumPopModel(BaseModel):
         self.top_entities = top_entities
         self.n_cand = n_cand
         self.half_life_units = half_life_units
+        self.data_root = data_root
         self._user_entity: pl.DataFrame | None = None
         self._entity_track: pl.DataFrame | None = None
         self._entity_col = f"{entity}_id"
@@ -73,9 +76,13 @@ class ArtistAlbumPopModel(BaseModel):
         )
 
         if self.entity == "artist":
-            mapping = load_artist_item_mapping()
+            mapping = load_artist_item_mapping(
+                Path(self.data_root) / "artist_item_mapping.parquet"
+            )
         else:
-            mapping = load_album_item_mapping()
+            mapping = load_album_item_mapping(
+                Path(self.data_root) / "album_item_mapping.parquet"
+            )
         mapping = mapping.with_columns([
             pl.col(self._entity_col).cast(pl.Int64),
             pl.col("item_id").cast(pl.Int64),

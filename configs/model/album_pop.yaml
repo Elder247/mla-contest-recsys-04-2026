@@ -4,3 +4,4 @@ entity: album
 top_entities: 10
 n_cand: 100
 half_life_units: 518400
+data_root: ${data.root}

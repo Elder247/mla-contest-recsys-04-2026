@@ -76,6 +76,7 @@ candidate_generators:
     top_entities: 10
     n_cand: 100
     half_life_units: 518400
+    data_root: ${data.root}
 
   - _target_: src.models.artist_pop.ArtistAlbumPopModel
     name: album_pop
@@ -83,6 +84,7 @@ candidate_generators:
     top_entities: 10
     n_cand: 100
     half_life_units: 518400
+    data_root: ${data.root}
 
   - _target_: src.models.recent_likes.RecentLikesModel
     name: recent_likes

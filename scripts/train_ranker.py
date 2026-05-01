@@ -145,6 +145,7 @@ def main(cfg: DictConfig) -> None:
             size=cfg.data.size,
             suffix="",
             force_refit=cfg.force_refit_cg,
+            cache_dir=cfg.cg_cache_dir,
         )
         cgs.append(cg)
 
