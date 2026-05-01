@@ -16,6 +16,7 @@ per query. The same index scales to millions of items on 500m / 5B; for 5B
 we may need to swap to IVFPQ to control memory — see roadmap Phase C.2.
 """
 import logging
+from pathlib import Path
 
 import faiss
 import numpy as np
@@ -53,6 +54,7 @@ class AudioEmbedKNNModel(BaseModel):
         ef_construction: int = 200,
         ef_search: int = 64,
         embeddings_path: str | None = None,
+        data_root: str = "data",
     ):
         self.name = name
         self.n_cand = n_cand
@@ -61,6 +63,7 @@ class AudioEmbedKNNModel(BaseModel):
         self.ef_construction = ef_construction
         self.ef_search = ef_search
         self.embeddings_path = embeddings_path
+        self.data_root = data_root
 
         self._item_matrix: np.ndarray | None = None  # (n_items, dim) float32, L2-norm
         self._item_ids: np.ndarray | None = None     # (n_items,) int64
@@ -100,7 +103,7 @@ class AudioEmbedKNNModel(BaseModel):
         )
 
         train_items = pos["item_id"].unique().to_list()
-        emb_path = self.embeddings_path or "data/embeddings.parquet"
+        emb_path = self.embeddings_path or str(Path(self.data_root) / "embeddings.parquet")
         log.info(
             "loading embeddings (filter to %d train items) from %s",
             len(train_items), emb_path,

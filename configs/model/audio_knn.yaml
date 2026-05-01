@@ -5,3 +5,4 @@ user_history_k: 20
 hnsw_m: 32
 ef_construction: 200
 ef_search: 64
+data_root: ${data.root}

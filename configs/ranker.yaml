@@ -99,6 +99,7 @@ candidate_generators:
     hnsw_m: 32
     ef_construction: 200
     ef_search: 64
+    data_root: ${data.root}
 
   # eSASRec — sequential SOTA. Disabled locally (heavy training);
   # uncomment on server (Phase C) and tune hyperparams via Optuna.
