@@ -69,7 +69,17 @@ class RankerModel:
                 .group_by("uid", maintain_order=True)
                 .head(1000)
             )
-            log.info("GPU mode: capped train to %d rows (max 1000/user)", len(df_train))
+            if df_val is not None:
+                df_val = (
+                    df_val
+                    .sort(["uid", "label"], descending=[False, True])
+                    .group_by("uid", maintain_order=True)
+                    .head(1000)
+                )
+            log.info(
+                "GPU mode: capped train to %d rows, val to %d rows (max 1000/user)",
+                len(df_train), len(df_val) if df_val is not None else 0,
+            )
 
         # CatBoostRanker requires query_ids to be contiguous per group.
         df_train = df_train.sort("uid")
