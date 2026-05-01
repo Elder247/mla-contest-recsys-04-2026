@@ -23,6 +23,7 @@ git clone https://github.com/Elder247/mla-contest-recsys-04-2026 mla_contest && 
 Python env (3.11 or 3.12)
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
+export PYTHONPATH=$(pwd)
 ```
 
 Install. CUDA torch first, then the rest:

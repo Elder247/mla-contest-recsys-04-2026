@@ -60,6 +60,17 @@ class RankerModel:
         self._feature_cols = [c for c in df_train.columns if c not in _SKIP_COLS]
         log.info("fitting RankerModel: %d features, train=%d rows", len(self._feature_cols), len(df_train))
 
+        # GPU YetiRank hard limit: max 1023 candidates per query group.
+        # Cap to 1000 keeping all positives (sort label desc before head).
+        if self.task_type.upper() == "GPU":
+            df_train = (
+                df_train
+                .sort(["uid", "label"], descending=[False, True])
+                .group_by("uid", maintain_order=True)
+                .head(1000)
+            )
+            log.info("GPU mode: capped train to %d rows (max 1000/user)", len(df_train))
+
         # CatBoostRanker requires query_ids to be contiguous per group.
         df_train = df_train.sort("uid")
         train_pool = Pool(
@@ -80,7 +91,7 @@ class RankerModel:
         )
         if self.task_type.upper() == "GPU":
             if self.devices is not None:
-                params["devices"] = self.devices
+                params["devices"] = str(self.devices)
         else:
             params["thread_count"] = -1
         if df_val is not None:
