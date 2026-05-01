@@ -517,15 +517,19 @@ def build_embed_features(
     )
     log.info("build_embed_features: %d candidate pairs", len(cand_pairs_eager))
 
+    # Only candidate users matter for user-mean embeddings — filter all history
+    # LazyFrames early so we don't scan the full 500m/5b event tables.
+    cand_uid_list = cand_pairs_eager["uid"].unique().to_list()
+
     # ── Determine which items we need embeddings for ────────────────────────
     # We need:
     #   (a) every candidate item (to look up the candidate's own embedding)
-    #   (b) every item that appears in any user's relevant history
-    #       (positive listens / likes / dislikes within cutoff)
+    #   (b) every item that appears in any *candidate* user's relevant history
     cand_items = cand_pairs_eager["item_id"].unique()
 
     L_pos = (
         listens_lf
+        .filter(pl.col("uid").is_in(cand_uid_list))
         .filter(pl.col("timestamp") <= cutoff_ts)
         .filter(pl.col("played_ratio_pct") > 50)
         .select(["uid", "item_id", "timestamp"])
@@ -533,10 +537,16 @@ def build_embed_features(
     )
     listen_items = L_pos.select("item_id").unique().collect()["item_id"]
 
-    likes_active = _effective_likes_lf(likes_lf, unlikes_lf, cutoff_ts)
+    likes_active = (
+        _effective_likes_lf(likes_lf, unlikes_lf, cutoff_ts)
+        .filter(pl.col("uid").is_in(cand_uid_list))
+    )
     like_items = likes_active.select("item_id").unique().collect()["item_id"]
 
-    dislikes_active = _effective_dislikes_lf(dislikes_lf, undislikes_lf, cutoff_ts)
+    dislikes_active = (
+        _effective_dislikes_lf(dislikes_lf, undislikes_lf, cutoff_ts)
+        .filter(pl.col("uid").is_in(cand_uid_list))
+    )
     dislike_items = dislikes_active.select("item_id").unique().collect()["item_id"]
 
     items_needed = (
@@ -561,7 +571,17 @@ def build_embed_features(
         log.warning("build_embed_features: no embeddings matched — returning NULL features")
         return _empty_embed_frame(cand_pairs_eager).lazy()
 
-    emb_arr = np.asarray(emb_df["normalized_embed"].to_list(), dtype=np.float32)
+    # .to_list() on a List(Float64) column creates a Python list-of-lists (~8 GB peak
+    # for 1.8M×128 items). explode() → 1-D Float32 series → zero-copy numpy → reshape
+    # stays under 1 GB.
+    n_emb = len(emb_df)
+    emb_arr = (
+        emb_df["normalized_embed"]
+        .explode()
+        .cast(pl.Float32)
+        .to_numpy()
+        .reshape(n_emb, -1)
+    )
     emb_item_ids = emb_df["item_id"].cast(pl.Int64).to_numpy()
     item_to_row: dict[int, int] = {int(i): k for k, i in enumerate(emb_item_ids.tolist())}
     dim = emb_arr.shape[1]

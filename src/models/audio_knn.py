@@ -121,8 +121,9 @@ class AudioEmbedKNNModel(BaseModel):
             len(emb_df), len(train_items), coverage * 100,
         )
 
+        _n_emb = len(emb_df)
         emb_arr = np.ascontiguousarray(
-            np.asarray(emb_df["normalized_embed"].to_list(), dtype=np.float32)
+            emb_df["normalized_embed"].explode().cast(pl.Float32).to_numpy().reshape(_n_emb, -1)
         )
         ids_arr = emb_df["item_id"].cast(pl.Int64).to_numpy()
         self._dim = int(emb_arr.shape[1])
