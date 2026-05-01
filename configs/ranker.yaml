@@ -125,6 +125,10 @@ ranker:
   l2_leaf_reg: 5.0
   early_stopping_rounds: 100
   random_state: 42
+  # Override on CLI to enable GPU: ranker.task_type=GPU ranker.devices='0'
+  # YetiRank supports GPU; ~3-5x speedup expected on 50m, more on 500m+
+  task_type: CPU
+  devices: null
 
 hydra:
   output_subdir: null

@@ -42,6 +42,8 @@ class RankerModel:
         l2_leaf_reg: float = 3.0,
         early_stopping_rounds: int = 50,
         random_state: int = 42,
+        task_type: str = "CPU",
+        devices: str | None = None,
     ):
         self.iterations = iterations
         self.depth = depth
@@ -49,6 +51,8 @@ class RankerModel:
         self.l2_leaf_reg = l2_leaf_reg
         self.early_stopping_rounds = early_stopping_rounds
         self.random_state = random_state
+        self.task_type = task_type
+        self.devices = devices
         self._model: CatBoostRanker | None = None
         self._feature_cols: list[str] = []
 
@@ -72,8 +76,13 @@ class RankerModel:
             random_seed=self.random_state,
             verbose=100,
             nan_mode="Min",
-            thread_count=-1,
+            task_type=self.task_type,
         )
+        if self.task_type.upper() == "GPU":
+            if self.devices is not None:
+                params["devices"] = self.devices
+        else:
+            params["thread_count"] = -1
         if df_val is not None:
             df_val = df_val.sort("uid")
             val_pool = Pool(
