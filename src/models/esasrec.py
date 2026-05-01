@@ -16,7 +16,7 @@ Pipeline:
 
 For 50m we mostly use this for *smoke-testing* the implementation; serious
 training on the full 500m sequence corpus runs on the server (Phase C),
-ideally on 2×A100 with DDP and ~10× more epochs.
+ideally on 2×A100 with DataParallel and ~20 epochs.
 
 Output of ``recommend`` matches the standard CG contract:
 ``uid, item_id, score, esasrec_rank``.
@@ -32,7 +32,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from src.data.dataset import positive_listens, to_sequential
+from src.data.dataset import positive_listens
 from src.models.base import BaseModel
 
 log = logging.getLogger(__name__)
@@ -99,30 +99,54 @@ class _SASRec(nn.Module):
 
 
 class _SeqDataset(Dataset):
-    """Sliding-window auto-regressive sequences.
+    """Auto-regressive sequences with optional sliding window.
 
-    For each user-history of token ids (1..n_items) we keep the last
-    ``max_len + 1`` tokens, left-pad if shorter, then split:
+    sequences: list of numpy int32 arrays (per-user token histories).
 
-        x = padded[:-1]   (input)
-        y = padded[1:]    (target — predict next token)
+    Without sliding window (window_stride=None): one sample per user —
+    the last max_len+1 tokens. With window_stride set, each user
+    contributes multiple overlapping windows of the same size, enabling
+    training on the full history rather than only the tail.
 
     Padding is index 0; loss masks positions where ``y == 0``.
     """
 
-    def __init__(self, sequences: list[list[int]], max_len: int):
-        self.sequences = sequences
+    def __init__(
+        self,
+        sequences: list[np.ndarray],
+        max_len: int,
+        window_stride: int | None = None,
+    ):
         self.max_len = max_len
+        self.sequences = sequences
+        # Build (seq_idx, end_pos) index lazily — avoids materialising all windows
+        self.index: list[tuple[int, int]] = []
+        for i, seq in enumerate(sequences):
+            if len(seq) < 2:
+                continue
+            if window_stride is None:
+                self.index.append((i, len(seq)))
+            else:
+                last_added = -1
+                for end in range(max_len + 1, len(seq) + 1, window_stride):
+                    self.index.append((i, end))
+                    last_added = end
+                # Always include the very last window (covers short sequences too)
+                if last_added != len(seq):
+                    self.index.append((i, len(seq)))
 
     def __len__(self) -> int:
-        return len(self.sequences)
+        return len(self.index)
 
     def __getitem__(self, idx: int):
-        seq = self.sequences[idx][-(self.max_len + 1):]
-        pad = (self.max_len + 1) - len(seq)
-        padded = [0] * pad + seq
-        x = torch.tensor(padded[:-1], dtype=torch.int64)
-        y = torch.tensor(padded[1:], dtype=torch.int64)
+        seq_idx, end = self.index[idx]
+        window = self.sequences[seq_idx][max(0, end - (self.max_len + 1)):end]
+        pad = (self.max_len + 1) - len(window)
+        padded = np.concatenate(
+            [np.zeros(pad, dtype=np.int64), window.astype(np.int64)]
+        )
+        x = torch.from_numpy(padded[:-1].copy())
+        y = torch.from_numpy(padded[1:].copy())
         return x, y
 
 
@@ -134,28 +158,53 @@ class _SeqDataset(Dataset):
 class ESASRecModel(BaseModel):
     """Sequential SASRec CG with sampled-softmax training.
 
-    Use small overrides (``max_epochs=1, emb_dim=64, batch_size=64``) for
-    local smoke-tests; production hyperparams target an 8-12h server run.
+    Key improvements vs naive stub:
+    - sequences stored as numpy int32 (7× less RAM than Python list[list[int]])
+    - item→token mapping via Polars join (vectorised, not O(N) Python dict loop)
+    - n_negatives=16 (was 256; at batch=512 that was 26.8 GB per step → OOM)
+    - batch_size=512 (was 128; A100 80 GB easily holds this)
+    - AdamW with weight_decay + gradient clipping
+    - early stopping on validation loss with best-state checkpoint
+    - optional sliding window (window_stride param)
+    - separate infer_batch_size to avoid OOM on all-item scoring (9.4M items)
+    - DataParallel when multiple CUDA GPUs are available
+    - AMP / BF16 autocast on CUDA (halves VRAM, ~2× speedup on A100)
 
-    Pickling is supported — the inner ``_SASRec`` lives on the configured
-    device but ``__getstate__`` moves it to CPU before serialisation, and
-    ``__setstate__`` puts it back on the auto-resolved device on load. So
-    the cache is portable across CPU/MPS/CUDA hosts.
+    Pickling is supported — ``__getstate__`` unwraps DataParallel and moves
+    weights to CPU; ``__setstate__`` restores DataParallel if applicable.
     """
+
+    name: str = "esasrec"
 
     def __init__(
         self,
         name: str = "esasrec",
         n_cand: int = 200,
+        # Architecture
         emb_dim: int = 256,
-        n_blocks: int = 2,
-        n_heads: int = 4,
+        n_blocks: int = 4,
+        n_heads: int = 8,
         dropout: float = 0.2,
         sequence_max_len: int = 200,
-        n_negatives: int = 256,
-        max_epochs: int = 100,
+        # Training
+        n_negatives: int = 16,
+        max_epochs: int = 20,
         lr: float = 1e-3,
-        batch_size: int = 128,
+        batch_size: int = 512,
+        weight_decay: float = 0.01,
+        max_grad_norm: float = 1.0,
+        # Early stopping
+        patience: int = 5,
+        val_pct: float = 0.1,
+        # DataLoader
+        num_workers: int = 4,
+        # AMP
+        use_amp: bool = True,
+        # Sliding window
+        window_stride: int | None = None,
+        # Inference
+        infer_batch_size: int = 64,
+        # Device / seed
         device: str = "auto",
         random_state: int = 42,
     ):
@@ -170,27 +219,43 @@ class ESASRecModel(BaseModel):
         self.max_epochs = max_epochs
         self.lr = lr
         self.batch_size = batch_size
+        self.weight_decay = weight_decay
+        self.max_grad_norm = max_grad_norm
+        self.patience = patience
+        self.val_pct = val_pct
+        self.num_workers = num_workers
+        self.use_amp = use_amp
+        self.window_stride = window_stride
+        self.infer_batch_size = infer_batch_size
         self.device = device
         self.random_state = random_state
 
-        self._model: Optional[_SASRec] = None
+        self._model: Optional[nn.Module] = None  # _SASRec or DataParallel(_SASRec)
         self._item_to_idx: dict[int, int] = {}
         self._idx_to_item: Optional[np.ndarray] = None  # (n_items + 1,)
-        self._user_history: dict[int, list[int]] = {}    # uid -> token list
+        self._user_history: dict[int, np.ndarray] = {}  # uid -> int32 tokens
 
     # ── pickle helpers ──────────────────────────────────────────────────
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         if self._model is not None:
-            state["_model"] = self._model.cpu()
+            inner = self._unwrap(self._model)
+            state["_model"] = inner.cpu()
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         if self._model is not None:
-            self._model.to(self._resolve_device())
+            dev = self._resolve_device()
+            self._model = self._model.to(dev)
+            if torch.cuda.device_count() > 1 and dev.startswith("cuda"):
+                self._model = nn.DataParallel(self._model)
 
     # ── helpers ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _unwrap(model: nn.Module) -> nn.Module:
+        return model.module if isinstance(model, nn.DataParallel) else model
+
     def _resolve_device(self) -> str:
         if self.device != "auto":
             return self.device
@@ -211,7 +276,7 @@ class ESASRecModel(BaseModel):
             len(pos), pos["uid"].n_unique(), pos["item_id"].n_unique(),
         )
 
-        # 1. Build item index. Tokens 1..n_items; 0 reserved for padding.
+        # 1. Build item vocabulary. Tokens 1..n_items; 0 reserved for padding.
         items_sorted = sorted(pos["item_id"].unique().to_list())
         self._item_to_idx = {int(it): i + 1 for i, it in enumerate(items_sorted)}
         idx_to_item = np.zeros(len(items_sorted) + 1, dtype=np.int64)
@@ -222,27 +287,55 @@ class ESASRecModel(BaseModel):
         n_items = len(items_sorted)
         log.info("ESASRec: vocab=%d (1..%d, 0=pad)", n_items, n_items)
 
-        # 2. Per-user chronological sequences
-        seq_df = to_sequential(pos)
-        sequences: list[list[int]] = []
-        user_ids: list[int] = []
-        for row in seq_df.iter_rows(named=True):
-            tokens = [self._item_to_idx[int(it)] for it in row["item_ids"]]
-            if len(tokens) < 2:
-                # Need at least one input + one target token.
-                continue
-            sequences.append(tokens)
-            user_ids.append(int(row["uid"]))
+        # 2. Vectorised item→token mapping via Polars join (avoids O(N) Python dict loop).
+        #    sort_by inside agg guarantees chronological order regardless of group_by hash.
+        item_vocab_df = pl.DataFrame({
+            "item_id": items_sorted,
+            "token": np.arange(1, n_items + 1, dtype=np.int32),
+        }).with_columns(pl.col("item_id").cast(pos["item_id"].dtype))
 
-        # Cache last K tokens per user for inference.
-        for uid, tokens in zip(user_ids, sequences):
-            self._user_history[uid] = tokens[-self.sequence_max_len:]
+        seq_df = (
+            pos
+            .join(item_vocab_df, on="item_id")
+            .group_by("uid")
+            .agg(
+                pl.col("token").sort_by("timestamp").alias("tokens"),
+            )
+            .sort("uid")
+        )
+
+        # Flat int32 numpy array split by lengths — 7× less RAM than Python list[list[int]]
+        flat: np.ndarray = seq_df["tokens"].explode().cast(pl.Int32).to_numpy()
+        lengths: np.ndarray = seq_df["tokens"].list.len().to_numpy()
+        offsets = np.concatenate([[0], np.cumsum(lengths)])
+        all_uid: np.ndarray = seq_df["uid"].to_numpy()
+
+        sequences: list[np.ndarray] = []
+        for i in range(len(seq_df)):
+            seq = flat[offsets[i]:offsets[i + 1]]
+            if len(seq) < 2:
+                continue
+            sequences.append(seq)
+            # Store last max_len tokens for inference
+            self._user_history[int(all_uid[i])] = seq[-self.sequence_max_len:]
+
         log.info("ESASRec: %d trainable sequences (>=2 tokens)", len(sequences))
 
-        # 3. Build model + optimizer
+        # 3. Train/val split for early stopping
+        rng = np.random.default_rng(self.random_state)
+        n_val = max(1, int(len(sequences) * self.val_pct))
+        val_idx_set = set(rng.choice(len(sequences), n_val, replace=False).tolist())
+        train_seqs = [s for i, s in enumerate(sequences) if i not in val_idx_set]
+        val_seqs = [s for i, s in enumerate(sequences) if i in val_idx_set]
+        log.info(
+            "ESASRec: train=%d sequences, val=%d sequences",
+            len(train_seqs), len(val_seqs),
+        )
+
+        # 4. Build model
         device = self._resolve_device()
         log.info("ESASRec: training on device=%s", device)
-        model = _SASRec(
+        sasrec = _SASRec(
             n_items=n_items,
             emb_dim=self.emb_dim,
             max_len=self.sequence_max_len,
@@ -250,60 +343,151 @@ class ESASRecModel(BaseModel):
             n_heads=self.n_heads,
             dropout=self.dropout,
         ).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=self.lr)
 
-        loader = DataLoader(
-            _SeqDataset(sequences, max_len=self.sequence_max_len),
+        use_dp = torch.cuda.device_count() > 1 and device.startswith("cuda")
+        model: nn.Module = nn.DataParallel(sasrec) if use_dp else sasrec
+        if use_dp:
+            log.info("ESASRec: using DataParallel on %d GPUs", torch.cuda.device_count())
+
+        use_amp = self.use_amp and device.startswith("cuda")
+        if use_amp:
+            log.info("ESASRec: BF16 AMP enabled")
+
+        opt = torch.optim.AdamW(
+            sasrec.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+
+        # DataLoader kwargs: num_workers>0 needs fork-safe sequences; pin_memory speeds H2D
+        _ldr_kw: dict = dict(
             batch_size=self.batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=0,
+            pin_memory=device.startswith("cuda"),
+        )
+        # num_workers > 0 requires picklable dataset — numpy arrays are fine
+        if self.num_workers > 0:
+            _ldr_kw.update(num_workers=self.num_workers, persistent_workers=True)
+
+        train_loader = DataLoader(
+            _SeqDataset(train_seqs, max_len=self.sequence_max_len, window_stride=self.window_stride),
+            **_ldr_kw,
+        )
+        val_loader = DataLoader(
+            _SeqDataset(val_seqs, max_len=self.sequence_max_len),  # no sliding window for val
+            **{**_ldr_kw, "shuffle": False},
         )
 
-        # 4. Training loop — sampled softmax (BCE on positive vs random negatives)
+        n_train_windows = len(train_loader.dataset)  # type: ignore[arg-type]
+        log.info(
+            "ESASRec: %d training windows (window_stride=%s)",
+            n_train_windows, self.window_stride,
+        )
+
+        # 5. Training loop with early stopping
+        best_val_loss = float("inf")
+        patience_counter = 0
+        best_state: dict | None = None
+
         for epoch in range(self.max_epochs):
+            # ── train ──
             model.train()
             running_loss = 0.0
             n_steps = 0
-            for x, y in loader:
+            for x, y in train_loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
-                hidden = model(x)                                # (B, L, D)
-                non_pad = y != 0                                 # (B, L)
-                if not non_pad.any():
-                    continue
-
-                pos_emb = model.item_emb(y)                      # (B, L, D)
-                neg_idx = torch.randint(
-                    1, n_items + 1,
-                    (x.size(0), x.size(1), self.n_negatives),
-                    device=device,
-                )
-                neg_emb = model.item_emb(neg_idx)                # (B, L, n_neg, D)
-
-                pos_score = (hidden * pos_emb).sum(-1)           # (B, L)
-                neg_score = (hidden.unsqueeze(2) * neg_emb).sum(-1)  # (B, L, n_neg)
-
-                pos_loss = -torch.nn.functional.logsigmoid(pos_score)
-                neg_loss = -torch.nn.functional.logsigmoid(-neg_score).mean(-1)
-                loss_per = (pos_loss + neg_loss) * non_pad.float()
-                loss = loss_per.sum() / non_pad.float().sum().clamp(min=1.0)
-
                 opt.zero_grad()
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_amp):
+                    hidden = model(x)                            # (B, L, D)
+                    non_pad = y != 0                             # (B, L)
+                    if not non_pad.any():
+                        continue
+
+                    pos_emb = sasrec.item_emb(y)                 # (B, L, D)
+                    neg_idx = torch.randint(
+                        1, n_items + 1,
+                        (x.size(0), x.size(1), self.n_negatives),
+                        device=device,
+                    )
+                    neg_emb = sasrec.item_emb(neg_idx)           # (B, L, n_neg, D)
+
+                    pos_score = (hidden * pos_emb).sum(-1)       # (B, L)
+                    neg_score = (hidden.unsqueeze(2) * neg_emb).sum(-1)  # (B, L, n_neg)
+
+                    pos_loss = -torch.nn.functional.logsigmoid(pos_score)
+                    neg_loss = -torch.nn.functional.logsigmoid(-neg_score).mean(-1)
+                    loss_per = (pos_loss + neg_loss) * non_pad.float()
+                    loss = loss_per.sum() / non_pad.float().sum().clamp(min=1.0)
+
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(sasrec.parameters(), self.max_grad_norm)
                 opt.step()
 
                 running_loss += float(loss.item())
                 n_steps += 1
 
-            avg = running_loss / max(n_steps, 1)
-            log.info("ESASRec epoch %d/%d: loss=%.4f", epoch + 1, self.max_epochs, avg)
+            avg_train = running_loss / max(n_steps, 1)
 
-        model.eval()
+            # ── val ──
+            model.eval()
+            val_loss_sum = 0.0
+            val_steps = 0
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_amp):
+                        hidden = model(x)
+                        non_pad = y != 0
+                        if not non_pad.any():
+                            continue
+                        pos_emb = sasrec.item_emb(y)
+                        neg_idx = torch.randint(
+                            1, n_items + 1,
+                            (x.size(0), x.size(1), self.n_negatives),
+                            device=device,
+                        )
+                        neg_emb = sasrec.item_emb(neg_idx)
+                        pos_score = (hidden * pos_emb).sum(-1)
+                        neg_score = (hidden.unsqueeze(2) * neg_emb).sum(-1)
+                        pos_loss = -torch.nn.functional.logsigmoid(pos_score)
+                        neg_loss = -torch.nn.functional.logsigmoid(-neg_score).mean(-1)
+                        loss_per = (pos_loss + neg_loss) * non_pad.float()
+                        vloss = loss_per.sum() / non_pad.float().sum().clamp(min=1.0)
+                    val_loss_sum += float(vloss.item())
+                    val_steps += 1
+
+            avg_val = val_loss_sum / max(val_steps, 1)
+            log.info(
+                "ESASRec epoch %d/%d: train_loss=%.4f val_loss=%.4f",
+                epoch + 1, self.max_epochs, avg_train, avg_val,
+            )
+
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                patience_counter = 0
+                best_state = {k: v.cpu().clone() for k, v in sasrec.state_dict().items()}
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    log.info("ESASRec early stopping at epoch %d", epoch + 1)
+                    break
+
+        # Restore best checkpoint
+        if best_state is not None:
+            sasrec.load_state_dict(best_state)
+            sasrec.to(device)
+            log.info("ESASRec: restored best checkpoint (val_loss=%.4f)", best_val_loss)
+
+        sasrec.eval()
         self._model = model
-        log.info("ESASRec fitted (n_items=%d, n_users=%d)",
-                 n_items, len(self._user_history))
+        log.info(
+            "ESASRec fitted (n_items=%d, n_users=%d)",
+            n_items, len(self._user_history),
+        )
 
     # ── recommend ───────────────────────────────────────────────────────
     def recommend(self, users: list[int], n: int = 100, **kwargs) -> pl.DataFrame:
@@ -322,12 +506,14 @@ class ESASRecModel(BaseModel):
                 "score": pl.Float32, rank_col: pl.Int32,
             })
 
-        device = next(self._model.parameters()).device
+        sasrec = self._unwrap(self._model)
+        device = next(sasrec.parameters()).device
         max_len = self.sequence_max_len
         n_items = len(self._item_to_idx)
-        bs = self.batch_size
+        bs = self.infer_batch_size  # separate from train batch_size to avoid OOM
         top_n = min(n, n_items)
 
+        self._model.eval()
         chunks: list[pl.DataFrame] = []
         with torch.no_grad():
             for start in range(0, len(u_with_history), bs):
@@ -337,12 +523,16 @@ class ESASRecModel(BaseModel):
                     tokens = self._user_history[uid][-max_len:]
                     X[i, -len(tokens):] = tokens
                 x = torch.from_numpy(X).to(device)
-                hidden = self._model(x)                  # (B, L, D)
-                user_h = hidden[:, -1, :]                # take last position (B, D)
-                scores = self._model.all_item_scores(user_h)  # (B, n_items)
+                with torch.cuda.amp.autocast(
+                    dtype=torch.bfloat16,
+                    enabled=self.use_amp and str(device).startswith("cuda"),
+                ):
+                    hidden = sasrec(x)                       # (B, L, D)
+                    user_h = hidden[:, -1, :].float()        # cast to fp32 for topk stability
+                    scores = sasrec.all_item_scores(user_h)  # (B, n_items)
                 top_scores, top_idx = torch.topk(scores, top_n, dim=1)
 
-                top_idx_np = top_idx.cpu().numpy() + 1  # back to 1-based token idx
+                top_idx_np = top_idx.cpu().numpy() + 1      # back to 1-based token idx
                 top_scores_np = top_scores.cpu().numpy()
 
                 B = len(chunk)

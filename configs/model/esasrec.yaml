@@ -2,19 +2,37 @@ _target_: src.models.esasrec.ESASRecModel
 name: esasrec
 n_cand: 200
 
-# Architecture (paper defaults; tune via Optuna phase=cg cg_name=esasrec)
+# Architecture — larger for 500m (was n_blocks=2, n_heads=4)
 emb_dim: 256
-n_blocks: 2
-n_heads: 4
+n_blocks: 4
+n_heads: 8
 dropout: 0.2
 sequence_max_len: 200
-n_negatives: 256
 
-# Training
-max_epochs: 100
+# Training — optimized for A100
+n_negatives: 16        # was 256: at batch=512 that's 26.8 GB/step → OOM
+max_epochs: 20         # sufficient at 500m scale; early stopping handles the rest
 lr: 0.001
-batch_size: 128
+batch_size: 512        # was 128; A100 80 GB comfortably holds 512
+weight_decay: 0.01
+max_grad_norm: 1.0
 
-# auto = mps/cuda/cpu in priority order; override to "cpu" for stable smoke tests
+# Early stopping (val_pct fraction of sequences held out for val loss)
+patience: 5
+val_pct: 0.1
+
+# DataLoader
+num_workers: 4         # was 0; parallel prefetch prevents GPU starvation
+use_amp: true          # BF16 autocast on CUDA: halves VRAM, ~2× speedup on A100
+
+# Sliding window — null = last sequence only (fast smoke-test on 50m)
+# Set 50-100 on server to use full history instead of just the tail
+window_stride: null
+
+# Inference — decoupled from batch_size to avoid OOM on all-item scoring
+# 64 × 9.4M items × 4B = 2.4 GB per batch (safe on any A100)
+infer_batch_size: 64
+
+# auto = cuda/mps/cpu in priority order; override to "cpu" for smoke tests
 device: auto
 random_state: 42
