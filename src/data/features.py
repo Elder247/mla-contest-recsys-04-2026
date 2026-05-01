@@ -583,6 +583,7 @@ def build_embed_features(
         .reshape(n_emb, -1)
     )
     emb_item_ids = emb_df["item_id"].cast(pl.Int64).to_numpy()
+    del emb_df  # Float64 list column no longer needed (~700 MB freed)
     item_to_row: dict[int, int] = {int(i): k for k, i in enumerate(emb_item_ids.tolist())}
     dim = emb_arr.shape[1]
     log.info("build_embed_features: embedding matrix %s", emb_arr.shape)
@@ -614,33 +615,56 @@ def build_embed_features(
     mean_disliked = _user_mean_embeddings(dislikes_user_item, item_to_row, emb_arr, dim)
 
     # ── Compute 4 cosines per candidate ──────────────────────────────────────
-    # Candidate → item_emb_row (-1 if missing); user → 4 user_emb_row variants.
-    cand_pdf = cand_pairs_eager.to_pandas()
-    cand_pdf["item_row"] = cand_pdf["item_id"].map(item_to_row).astype("Int64")
+    # Old approach: emb_arr[ir] where |ir|=5M creates a 5M×128 float32 copy
+    # (2.56 GB) called 4 times.  New approach: sort candidates by uid once,
+    # then per-user matrix-vector multiply (max ~560×128 at a time → <1 MB).
+    uid_arr = cand_pairs_eager["uid"].cast(pl.Int64).to_numpy()
+    iid_arr = cand_pairs_eager["item_id"].cast(pl.Int64).to_numpy()
 
-    def _cos_for(user_means: dict[int, int], user_emb: np.ndarray) -> np.ndarray:
-        """Vectorised cos for the candidate set against the given user-mean dict."""
-        u_rows = cand_pdf["uid"].map(user_means).astype("Int64")
-        # mask: both item and user vectors present
-        mask = cand_pdf["item_row"].notna() & u_rows.notna()
-        out = np.full(len(cand_pdf), np.nan, dtype=np.float32)
-        if not mask.any():
-            return out
-        ir = cand_pdf.loc[mask, "item_row"].to_numpy(dtype=np.int64)
-        ur = u_rows[mask].to_numpy(dtype=np.int64)
-        # Both emb_arr rows and user_emb rows are L2-normalised → dot == cosine.
-        out[mask.to_numpy()] = (emb_arr[ir] * user_emb[ur]).sum(axis=1).astype(np.float32)
+    # Vectorised item_id → emb_arr row index (searchsorted, -1 if missing)
+    emb_sorted_pos = np.argsort(emb_item_ids)
+    emb_sorted_ids = emb_item_ids[emb_sorted_pos]
+
+    def _item_rows(ids: np.ndarray) -> np.ndarray:
+        pos = np.searchsorted(emb_sorted_ids, ids)
+        pos_c = np.minimum(pos, len(emb_sorted_ids) - 1)
+        return np.where(emb_sorted_ids[pos_c] == ids, emb_sorted_pos[pos_c], np.int64(-1))
+
+    item_rows_all = _item_rows(iid_arr)
+
+    # Sort candidates by uid once; all four _cos_sorted calls share the result.
+    sort_order = np.argsort(uid_arr, kind="stable")
+    s_uids = uid_arr[sort_order]
+    s_irows = item_rows_all[sort_order]
+    uid_changes = np.concatenate(([True], s_uids[1:] != s_uids[:-1]))
+    block_starts = np.where(uid_changes)[0]
+    block_uids = s_uids[block_starts]
+    block_ends = np.append(block_starts[1:], len(s_uids))
+
+    def _cos_sorted(uid_to_row: dict[int, int], user_emb: np.ndarray) -> np.ndarray:
+        """Per-user matmul; peak memory ≈ max_cands_per_user × dim × 4B."""
+        result = np.full(len(sort_order), np.nan, dtype=np.float32)
+        for uid, start, end in zip(block_uids, block_starts, block_ends):
+            u_row = uid_to_row.get(int(uid))
+            if u_row is None:
+                continue
+            irows = s_irows[start:end]
+            valid = irows >= 0
+            if valid.any():
+                result[start:end][valid] = emb_arr[irows[valid]] @ user_emb[u_row]
+        out = np.empty(len(sort_order), dtype=np.float32)
+        out[sort_order] = result
         return out
 
-    cos_all = _cos_for(*mean_all)
-    cos_lastk = _cos_for(*mean_lastk)
-    cos_liked = _cos_for(*mean_liked)
-    cos_disliked = _cos_for(*mean_disliked)
+    cos_all = _cos_sorted(*mean_all)
+    cos_lastk = _cos_sorted(*mean_lastk)
+    cos_liked = _cos_sorted(*mean_liked)
+    cos_disliked = _cos_sorted(*mean_disliked)
 
     return (
         pl.DataFrame({
-            "uid": cand_pdf["uid"].to_numpy(),
-            "item_id": cand_pdf["item_id"].to_numpy(),
+            "uid": uid_arr,
+            "item_id": iid_arr,
             "embed_cos_user_mean": cos_all,
             "embed_cos_user_last_k": cos_lastk,
             "embed_cos_user_liked_mean": cos_liked,
@@ -717,19 +741,23 @@ def _user_mean_embeddings(
     if len(pairs) == 0:
         return {}, np.zeros((0, dim), dtype=np.float32)
 
-    df = pairs.to_pandas()
-    df["row"] = df["item_id"].map(item_to_row).astype("Int64")
-    df = df.dropna(subset=["row"])
-    if len(df) == 0:
+    uid_np = pairs["uid"].cast(pl.Int64).to_numpy()
+    iid_np = pairs["item_id"].cast(pl.Int64).to_numpy()
+    rows = np.fromiter(
+        (item_to_row.get(int(i), -1) for i in iid_np),
+        dtype=np.int64,
+        count=len(iid_np),
+    )
+    valid = rows >= 0
+    if not valid.any():
         return {}, np.zeros((0, dim), dtype=np.float32)
-    df["row"] = df["row"].astype(np.int64)
 
-    uids = df["uid"].to_numpy()
-    rows = df["row"].to_numpy()
-    unique_uids, inv = np.unique(uids, return_inverse=True)
+    uid_v = uid_np[valid]
+    rows_v = rows[valid]
+    unique_uids, inv = np.unique(uid_v, return_inverse=True)
     sums = np.zeros((len(unique_uids), dim), dtype=np.float32)
     counts = np.zeros(len(unique_uids), dtype=np.int32)
-    np.add.at(sums, inv, emb_arr[rows])
+    np.add.at(sums, inv, emb_arr[rows_v])
     np.add.at(counts, inv, 1)
     means = sums / counts[:, None].astype(np.float32)
     norms = np.linalg.norm(means, axis=1, keepdims=True)

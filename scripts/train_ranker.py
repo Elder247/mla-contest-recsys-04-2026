@@ -19,6 +19,7 @@ Usage:
     python scripts/train_ranker.py data=50m run_id=006
 """
 import csv
+import gc
 import logging
 import pickle
 from datetime import datetime
@@ -106,6 +107,7 @@ def main(cfg: DictConfig) -> None:
         timestamp_col=cfg.split.timestamp_col,
     )
     log.info("train=%d  val=%d  test=%d", len(split.train), len(split.val), len(split.test))
+    del listens  # split holds filtered copies; original no longer needed
 
     eval_users = load_eval_users(cfg.data.users_csv)
     gt_val = _ground_truth(split.val, eval_users)
@@ -149,12 +151,31 @@ def main(cfg: DictConfig) -> None:
         )
         cgs.append(cg)
 
-    # ── 3. Generate candidates for users with val ground truth ───────────────
+    # Free training data now that all CGs are fitted — split.train can be large
+    # (e.g. 200M rows on 500m).  gt_val / gt_test are already computed above.
+    del data_sources, split, likes_train
+    gc.collect()
+    log.info("training data freed before candidate generation")
+
+    # ── 3. Generate candidates for BOTH sets while CG models are in memory ───
+    # Generating eval candidates here (instead of after features) lets us delete
+    # all CG models before the expensive features.collect() call, which can save
+    # 20-50 GB on the 500m/5b datasets.
     val_users_with_gt = gt_val["uid"].unique().to_list()
-    cg_dfs = generate_candidates(cgs, val_users_with_gt)
+    cg_dfs_val = generate_candidates(cgs, val_users_with_gt)
+    cg_dfs_full = generate_candidates(cgs, eval_users)
+
+    cg_names = ",".join(cg.name for cg in cgs)
+    del cgs
+    gc.collect()
+    log.info("CG models freed; proceeding to merge + feature computation")
 
     # ── 4. Merge → optional dislike filter → cg_recall ───────────────────────
-    merged = merge_candidates(cg_dfs)
+    merged = merge_candidates(cg_dfs_val)
+    del cg_dfs_val
+
+    merged_full = merge_candidates(cg_dfs_full)
+    del cg_dfs_full
 
     if cfg.filter_dislikes:
         # Use only events recorded up to the train cutoff (computed above)
@@ -178,6 +199,7 @@ def main(cfg: DictConfig) -> None:
             "dislike filter: dropped %d / %d candidate rows",
             before - len(merged), before,
         )
+        merged_full = apply_exclude_filter(merged_full, active_dislikes)
 
     upper_bound = cg_recall(merged, gt_val)
     log.info("CG-recall@∞ on val (upper bound for ranker, ×1000 scale): %.2f", upper_bound)
@@ -232,10 +254,7 @@ def main(cfg: DictConfig) -> None:
     ranker.fit(df_train, df_val_ranker)
 
     # ── 7. Eval Recall@100 on val + test ─────────────────────────────────────
-    cg_dfs_full = generate_candidates(cgs, eval_users)
-    merged_full = merge_candidates(cg_dfs_full)
-    if cfg.filter_dislikes:
-        merged_full = apply_exclude_filter(merged_full, active_dislikes)
+    # merged_full was generated and filtered in step 3/4 above.
     log.info("computing features for full eval set")
     feats_full_lf = add_features(
         merged_full.lazy(),
@@ -279,7 +298,6 @@ def main(cfg: DictConfig) -> None:
 
     results_path = Path(cfg.output_dir) / "results.csv"
     run_id_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cg_names = ",".join(cg.name for cg in cgs)
     for split_name, score in [("val", score_val), ("test", score_test)]:
         _append_results(results_path, {
             "run_id": run_id_ts,
