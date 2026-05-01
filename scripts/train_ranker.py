@@ -217,9 +217,9 @@ def main(cfg: DictConfig) -> None:
         features_dir = Path(cfg.features_dir)
         features_dir.mkdir(parents=True, exist_ok=True)
         cache_path = features_dir / f"{cfg.run_id}_train.parquet"
+        labeled = features_lf.collect()
         log.info("caching labeled features → %s", cache_path)
-        features_lf.sink_parquet(str(cache_path), compression="zstd")
-        labeled = pl.scan_parquet(str(cache_path)).collect()
+        labeled.write_parquet(str(cache_path), compression="zstd")
     else:
         labeled = features_lf.collect()
     log.info("labeled+features: %d rows × %d cols", len(labeled), len(labeled.columns))
@@ -253,9 +253,9 @@ def main(cfg: DictConfig) -> None:
         features_dir = Path(cfg.features_dir)
         features_dir.mkdir(parents=True, exist_ok=True)
         eval_cache_path = features_dir / f"{cfg.run_id}_eval.parquet"
+        feats_full = feats_full_lf.collect()
         log.info("caching eval features → %s", eval_cache_path)
-        feats_full_lf.sink_parquet(str(eval_cache_path), compression="zstd")
-        feats_full = pl.scan_parquet(str(eval_cache_path)).collect()
+        feats_full.write_parquet(str(eval_cache_path), compression="zstd")
     else:
         feats_full = feats_full_lf.collect()
     log.info("full eval features: %d rows × %d cols", len(feats_full), len(feats_full.columns))
