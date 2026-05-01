@@ -15,41 +15,61 @@ Architecture, hygiene, and current CG bank are documented in
 Assumes Linux + NVIDIA GPU. Adjust the `data.root` / `artifacts_root` paths to
 your persistent disk if applicable (e.g. `~/dc-remote/...`).
 
+Clone
 ```bash
-# 1. Clone
-git clone <repo-url> mla_contest && cd mla_contest
+git clone https://github.com/Elder247/mla-contest-recsys-04-2026 mla_contest && cd mla_contest
+```
 
-# 2. Python env (3.11 or 3.12)
+Python env (3.11 or 3.12)
+```bash
 python3.12 -m venv .venv && source .venv/bin/activate
+```
 
-# 3. Install. CUDA torch first, then the rest:
+Install. CUDA torch first, then the rest:
+```bash
 pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.6.0
 pip install -r requirements.txt
+```
 
-# 4. Download data to persistent disk
+Download 50m data to persistent disk
+```bash
 mkdir -p ~/dc-remote/{data,artifacts}
-python -u scripts/download_data.py dataset_size=500m data.root=~/dc-remote/data
-# (50m / 5b sizes work the same — change dataset_size=)
-# embeddings.parquet (~13 GB, shared across sizes) is downloaded automatically
+python3 -u scripts/download_data.py +dataset_size=50m data.root=/home/astrofimuk/dc-remote/data model=pop
+```
 
-# 5. Verify the install
-pytest tests/ -v
+Verify the install
+```bash
+python3 -m pytest tests/ -v
+```
 
-# 6. First baseline on 500m
-python -u scripts/train_ranker.py \
-    data=500m run_id=server_001 \
-    data.root=~/dc-remote/data \
-    artifacts_root=~/dc-remote/artifacts \
+Baseline on 50m (CPU)
+```bash
+python -u scripts/train_ranker.py data=50m run_id=server_001 \
+    data.root=/home/astrofimuk/dc-remote/data \
+    artifacts_root=/home/astrofimuk/dc-remote/artifacts \
     cache_features=true 2>&1 | tee /tmp/run.log
+```
 
-# 7. Build the submission CSV
+Baseline on 50m (GPU)
+```bash
+python -u scripts/train_ranker.py data=50m run_id=server_001_gpu \
+    data.root=/home/astrofimuk/dc-remote/data \
+    artifacts_root=/home/astrofimuk/dc-remote/artifacts \
+    ranker.task_type=GPU ranker.devices='0' \
+    cache_features=true 2>&1 | tee /tmp/run_gpu.log
+```
+
+Build the submission CSV
+```bash
 python -u scripts/submit_ranker.py \
-    data=500m run_id=server_001 \
-    data.root=~/dc-remote/data \
-    artifacts_root=~/dc-remote/artifacts \
-    submission_name=server_baseline
+    data=50m run_id=server_001_gpu \
+    data.root=/home/astrofimuk/dc-remote/data \
+    artifacts_root=/home/astrofimuk/dc-remote/artifacts \
+    submission_name=server_gpu_baseline
+```
 
-# 8. (optional) Validate the CSV format before uploading
+Validate the CSV format before uploading (optional)
+```bash
 python scripts/validate_submission.py submissions/sub_server_001_*.csv
 ```
 
@@ -58,7 +78,6 @@ need for the `data.root` / `artifacts_root` overrides; data lives in
 `./data`, artifacts in `./artifacts`. CPU torch is fine; faiss-cpu is the
 default on Apple Silicon.
 
----
 
 ## Layout
 
