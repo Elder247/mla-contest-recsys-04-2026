@@ -77,13 +77,47 @@ def build_csr_matrix(
     The implicit library scales confidence as C = 1 + alpha * matrix,
     so non-uniform weights translate into per-interaction confidence.
     Duplicate (user, item) rows are summed by scipy's COO→CSR conversion.
+
+    Uid/item lookup is vectorised through a polars left-join — the previous
+    Python list-comprehension over ``df[col].to_list()`` materialised the
+    full column as Python ints (~7 GB transient on 500m).
     """
-    rows = np.array([uid_map[u] for u in df[user_col].to_list()], dtype=np.int32)
-    cols = np.array([item_map[it] for it in df[item_col].to_list()], dtype=np.int32)
+    uid_lookup = pl.DataFrame(
+        {
+            "_lookup_key": np.fromiter(uid_map.keys(), dtype=np.int64, count=len(uid_map)),
+            "_row": np.fromiter(uid_map.values(), dtype=np.int32, count=len(uid_map)),
+        }
+    )
+    item_lookup = pl.DataFrame(
+        {
+            "_lookup_key": np.fromiter(item_map.keys(), dtype=np.int64, count=len(item_map)),
+            "_col": np.fromiter(item_map.values(), dtype=np.int32, count=len(item_map)),
+        }
+    )
+
+    select_cols = ["_row", "_col"]
+    if weight_col is not None:
+        select_cols.append(weight_col)
+
+    joined = (
+        df
+        .lazy()
+        .with_columns([
+            pl.col(user_col).cast(pl.Int64).alias("_uid_key"),
+            pl.col(item_col).cast(pl.Int64).alias("_item_key"),
+        ])
+        .join(uid_lookup.lazy(), left_on="_uid_key", right_on="_lookup_key", how="inner")
+        .join(item_lookup.lazy(), left_on="_item_key", right_on="_lookup_key", how="inner")
+        .select(select_cols)
+        .collect()
+    )
+
+    rows = joined["_row"].to_numpy()
+    cols = joined["_col"].to_numpy()
     if weight_col is None:
         data = np.ones(len(rows), dtype=np.float32)
     else:
-        data = df[weight_col].to_numpy().astype(np.float32)
+        data = joined[weight_col].to_numpy().astype(np.float32, copy=False)
     return csr_matrix(
         (data, (rows, cols)),
         shape=(len(uid_map), len(item_map)),

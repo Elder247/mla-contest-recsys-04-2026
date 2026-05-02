@@ -88,6 +88,9 @@ class RankerModel:
             label=df_train["label"].to_pandas(),
             group_id=df_train["uid"].to_pandas(),
         )
+        # Pool has internalised the data; drop the polars frame so the GC can
+        # release ~3 GB on 500m before fit() builds CatBoost's own arena.
+        del df_train
         params = dict(
             loss_function="YetiRank",
             iterations=self.iterations,
@@ -111,6 +114,7 @@ class RankerModel:
                 label=df_val["label"].to_pandas(),
                 group_id=df_val["uid"].to_pandas(),
             )
+            del df_val
             params["early_stopping_rounds"] = self.early_stopping_rounds
             self._model = CatBoostRanker(**params)
             self._model.fit(train_pool, eval_set=val_pool)

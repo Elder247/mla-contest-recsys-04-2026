@@ -35,6 +35,23 @@ output_dir: ${artifacts_root}        # results.csv, feature_importance_*.csv
 ranker_dir: ${artifacts_root}        # ranker_{run_id}.pkl
 features_dir: ${artifacts_root}/features
 cg_cache_dir: ${artifacts_root}/cg
+candidates_dir: ${artifacts_root}/candidates
+gt_dir: ${artifacts_root}/gt
+
+# ── Phase-internal overrides (set by scripts/train_ranker.py and
+#    scripts/submit_ranker.py when launching scripts/_phases/* subprocesses).
+#    Leave null on the CLI of the orchestrators; they're only meant for the
+#    subprocess targets. Direct invocation of the phase scripts can override
+#    them as `key=value` without the Hydra `+` prefix.
+suffix: ""
+train_cutoff_ts: null
+users_source: null
+output_dir_phase: null
+dislike_cutoff_ts: null
+merged_path: null
+output_path: null
+cutoff_ts: null
+label_gt_path: null
 
 # ── Candidate generators ─────────────────────────────────────────────────
 # Each entry is a Hydra-instantiable config. ``name`` becomes the CG's

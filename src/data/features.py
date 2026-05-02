@@ -397,12 +397,27 @@ def build_cross_features(
 
     Uses primary artist/album per item (``min(entity_id)``) to keep joins
     explosion-free.
+
+    Memory note: the ``user_artist`` / ``user_album`` / ``user_total`` group_bys
+    only matter for candidate users (10K eval users). Restricting listens to
+    that user set BEFORE the group_by drops the heavy intermediate from
+    500M rows to ~10M on 500m — the same ``semi-join`` trick used in
+    ``build_pair_features``. ``artist_pop`` / ``album_pop`` stay global since
+    they aggregate by entity_id only (small result, cheap intermediate).
     """
-    L = (
+    cand_uids = (
+        candidates_lf
+        .select(pl.col("uid").cast(pl.Int64))
+        .unique()
+    )
+
+    L_full = (
         listens_lf
         .filter(pl.col("timestamp") <= cutoff_ts)
         .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
     )
+    L_user = L_full.join(cand_uids, on="uid", how="semi")
+
     artist_primary = _primary_entity_map(artist_map_lf, "artist_id").with_columns(
         pl.col("item_id").cast(pl.Int64)
     )
@@ -410,32 +425,36 @@ def build_cross_features(
         pl.col("item_id").cast(pl.Int64)
     )
 
-    L_with_entities = (
-        L.join(artist_primary, on="item_id", how="left")
+    L_user_entities = (
+        L_user.join(artist_primary, on="item_id", how="left")
+        .join(album_primary, on="item_id", how="left")
+    )
+    L_full_entities = (
+        L_full.join(artist_primary, on="item_id", how="left")
         .join(album_primary, on="item_id", how="left")
     )
 
     user_artist = (
-        L_with_entities
+        L_user_entities
         .group_by(["uid", "artist_id"])
         .agg(pl.len().cast(pl.Int32).alias("user_artist_listens"))
     )
     user_album = (
-        L_with_entities
+        L_user_entities
         .group_by(["uid", "album_id"])
         .agg(pl.len().cast(pl.Int32).alias("user_album_listens"))
     )
     user_total = (
-        L.group_by("uid")
+        L_user.group_by("uid")
         .agg(pl.len().cast(pl.Int32).alias("_user_total_listens"))
     )
     artist_pop = (
-        L_with_entities
+        L_full_entities
         .group_by("artist_id")
         .agg(pl.len().cast(pl.Int32).alias("artist_pop"))
     )
     album_pop = (
-        L_with_entities
+        L_full_entities
         .group_by("album_id")
         .agg(pl.len().cast(pl.Int32).alias("album_pop"))
     )

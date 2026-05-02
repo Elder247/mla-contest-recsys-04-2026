@@ -1,27 +1,37 @@
-"""Multi-CG → CatBoost Ranker training pipeline.
+"""Multi-CG → CatBoost Ranker training pipeline (subprocess-staged).
 
-This script trains the ranker only — it does NOT generate a submission.
-For submission, run ``scripts/submit_ranker.py`` with the same ``run_id``;
-that script reuses CGs fitted on full data via the cache.
+The pipeline is split into three phases that run in their own Python
+subprocesses so the OS reclaims Polars/Arrow allocator RSS at phase
+boundaries (essential on 500m / 5B with 120 GB RAM):
 
-Steps:
-  1. Load listens, temporal_split (val_days=7, gap_days=1).
-  2. For each CG in cfg.candidate_generators: fit_or_load_cg (cache lookup).
-  3. Generate ``cg.n_cand`` candidates per eval user from each CG.
-  4. merge_candidates → cg_recall (upper bound for the ranker).
-  5. add_features (LazyFrame-based: ~48 user/item/pair/cross features).
-  6. Label vs val ground truth, GroupShuffleSplit 80/20, fit CatBoost YetiRank.
-  7. Recall@100 on val + test → experiment-log.md + artifacts/results.csv.
-  8. Pickle ranker → artifacts/ranker_{run_id}.pkl.
-  9. Optional CatBoost feature importance → artifacts/feature_importance_{run_id}.csv.
+  Phase 1 — fit candidate generators           (scripts/_phases/fit_cgs.py)
+  Phase 2 — generate candidates + merge        (scripts/_phases/gen_candidates.py)
+  Phase 3 — compute features parquet           (scripts/_phases/compute_features.py)
+  Phase 4 — (this process) train the ranker, evaluate, log results
+
+Per-run intermediate artifacts:
+
+  artifacts/gt/{run_id}/gt_val.parquet          ground-truth pairs (val window)
+  artifacts/gt/{run_id}/gt_test.parquet         ground-truth pairs (test window)
+  artifacts/candidates/{run_id}/val/cg_*.parquet + merged.parquet
+  artifacts/candidates/{run_id}/eval/cg_*.parquet + merged.parquet
+  artifacts/features/{run_id}_train.parquet     labeled features for ranker fit
+  artifacts/features/{run_id}_eval.parquet      features for full eval users
+
+The ranker itself is fit + evaluated in this orchestrator process, since
+CatBoost is the next-largest memory consumer and we want it to start with
+a clean RSS baseline.
 
 Usage:
-    python scripts/train_ranker.py data=50m run_id=006
+    python -u scripts/train_ranker.py data=50m run_id=006
 """
+from __future__ import annotations
+
 import csv
-import gc
 import logging
 import pickle
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -31,53 +41,54 @@ import polars as pl
 from omegaconf import DictConfig, OmegaConf
 from sklearn.model_selection import GroupShuffleSplit
 
-from src.data.dataset import (
-    effective_dislikes,
-    load_dislikes,
-    load_likes,
-    load_listens,
-    load_undislikes,
-    positive_listens,
-)
-from src.data.features import add_features
-from src.data.splits import temporal_split
 from src.evaluation.metrics import recall_at_k
-from src.inference.merge_candidates import cg_recall, merge_candidates
-from src.inference.pipeline import (
-    apply_exclude_filter,
-    generate_candidates,
-    load_eval_users,
+from src.inference.merge_candidates import cg_recall
+from src.inference.phases import (
+    derive_split_metadata,
+    load_eval_users_from_csv,
+    write_ground_truth,
 )
 from src.models.catboost_ranker import RankerModel
-from src.training.cg_cache import fit_or_load_cg
 from src.utils import setup_logging
 
 log = logging.getLogger(__name__)
 
 
-def _ground_truth(df: pl.DataFrame, users: list[int]) -> pl.DataFrame:
-    return (
-        df.select(["uid", "item_id"])
-        .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
-        .filter(pl.col("uid").is_in(users))
-        .unique()
-    )
+# ---------------------------------------------------------------------------
+# Subprocess helpers
+# ---------------------------------------------------------------------------
+
+def _run_phase(script: str, overrides: list[str]) -> None:
+    """Run a phase script as ``python -u <script> <overrides>``.
+
+    Bubbles up the subprocess's exit code on failure. Stdout/stderr stream
+    to the parent's TTY so ``tee /tmp/run.log`` continues to capture
+    everything in order.
+    """
+    cmd = [sys.executable, "-u", script] + overrides
+    log.info("running phase: %s", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
 
-def _label_candidates(candidates: pl.DataFrame, ground_truth: pl.DataFrame) -> pl.DataFrame:
-    pos = ground_truth.with_columns(pl.lit(1).cast(pl.Int8).alias("label"))
-    return (
-        candidates
-        .join(pos, on=["uid", "item_id"], how="left")
-        .with_columns(pl.col("label").fill_null(0).cast(pl.Int8))
-    )
+def _hydra_override(key: str, value) -> str:
+    """Build a single Hydra CLI override (handles None → 'null' and quoting)."""
+    if value is None:
+        return f"{key}=null"
+    if isinstance(value, bool):
+        return f"{key}={'true' if value else 'false'}"
+    return f"{key}={value}"
 
+
+# ---------------------------------------------------------------------------
+# Ranker training (in-process)
+# ---------------------------------------------------------------------------
 
 def _split_for_ranker(df: pl.DataFrame, seed: int) -> tuple[pl.DataFrame, pl.DataFrame]:
-    pdf = df.to_pandas()
+    """80/20 group split by uid without round-tripping through pandas."""
+    uids = df["uid"].to_numpy()
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
-    train_idx, val_idx = next(gss.split(pdf, groups=pdf["uid"]))
-    return pl.from_pandas(pdf.iloc[train_idx]), pl.from_pandas(pdf.iloc[val_idx])
+    train_idx, val_idx = next(gss.split(np.zeros(len(df)), groups=uids))
+    return df[train_idx], df[val_idx]
 
 
 def _append_results(path: Path, row: dict) -> None:
@@ -89,195 +100,164 @@ def _append_results(path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
 @hydra.main(config_path="../configs", config_name="ranker", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     setup_logging()
     log.info("config:\n%s", OmegaConf.to_yaml(cfg))
     np.random.seed(cfg.seed)
 
-    # ── 1. Load data & split ──────────────────────────────────────────────────
-    log.info("loading listens from %s", cfg.data.listens)
-    listens = positive_listens(load_listens(path=cfg.data.listens))
-    log.info("positive listens: %d rows", len(listens))
+    run_id = str(cfg.run_id)
+    eval_users = load_eval_users_from_csv(cfg.data.users_csv)
 
-    split = temporal_split(
-        listens,
+    # ── 1. Derive temporal-split metadata + write ground truth ───────────────
+    log.info("deriving temporal-split metadata from %s", cfg.data.listens)
+    meta = derive_split_metadata(
+        cfg.data.listens,
         val_days=cfg.split.val_days,
         gap_days=cfg.split.gap_days,
         timestamp_col=cfg.split.timestamp_col,
     )
-    log.info("train=%d  val=%d  test=%d", len(split.train), len(split.val), len(split.test))
-    del listens  # split holds filtered copies; original no longer needed
+    log.info(
+        "split: t_max=%d val_start=%d val_end=%d test_start=%d t_end=%d train_max_ts=%d",
+        meta["t_max"], meta["val_start"], meta["val_end"],
+        meta["test_start"], meta["t_end"], meta["train_max_ts"],
+    )
 
-    eval_users = load_eval_users(cfg.data.users_csv)
-    gt_val = _ground_truth(split.val, eval_users)
-    gt_test = _ground_truth(split.test, eval_users)
+    gt_dir = Path(cfg.gt_dir) / run_id
+    gt_val_path = write_ground_truth(
+        cfg.data.listens, eval_users,
+        meta["val_start"], meta["val_end"],
+        gt_dir / "gt_val.parquet",
+    )
+    gt_test_path = write_ground_truth(
+        cfg.data.listens, eval_users,
+        meta["test_start"], meta["t_end"],
+        gt_dir / "gt_test.parquet",
+    )
+
+    # ── 2. Phase 1 — fit CGs (subprocess) ────────────────────────────────────
+    # train_cutoff_ts = val_start so listens used for fit have timestamp <
+    # val_start (matches the legacy split.train["timestamp"].max() bound).
+    train_cutoff_ts = meta["val_start"]
+    fit_overrides: list[str] = [
+        _hydra_override("data", cfg.data.size),
+        _hydra_override("run_id", run_id),
+        _hydra_override("artifacts_root", cfg.artifacts_root),
+        _hydra_override("data.root", cfg.data.root),
+        _hydra_override("force_refit_cg", bool(cfg.force_refit_cg)),
+        _hydra_override("suffix", ""),
+        _hydra_override("train_cutoff_ts", train_cutoff_ts),
+    ]
+    _run_phase("scripts/_phases/fit_cgs.py", fit_overrides)
+
+    # ── 3. Phase 2 — generate candidates × 2 (val users + full eval) ─────────
+    cand_root = Path(cfg.candidates_dir) / run_id
+    val_users_with_gt = (
+        pl.read_parquet(gt_val_path).get_column("uid").unique().sort().to_list()
+    )
+    val_users_csv = cand_root / "val_users.csv"
+    eval_users_csv = cand_root / "eval_users.csv"
+    cand_root.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"uid": val_users_with_gt}).write_csv(val_users_csv)
+    pl.DataFrame({"uid": eval_users}).write_csv(eval_users_csv)
+
+    val_dir = cand_root / "val"
+    eval_dir = cand_root / "eval"
+
+    common_gen = [
+        _hydra_override("data", cfg.data.size),
+        _hydra_override("run_id", run_id),
+        _hydra_override("artifacts_root", cfg.artifacts_root),
+        _hydra_override("data.root", cfg.data.root),
+        _hydra_override("suffix", ""),
+        _hydra_override("filter_dislikes", bool(cfg.filter_dislikes)),
+        _hydra_override("dislike_cutoff_ts", train_cutoff_ts),
+    ]
+    _run_phase("scripts/_phases/gen_candidates.py", common_gen + [
+        _hydra_override("users_source", str(val_users_csv)),
+        _hydra_override("output_dir_phase", str(val_dir)),
+    ])
+    _run_phase("scripts/_phases/gen_candidates.py", common_gen + [
+        _hydra_override("users_source", str(eval_users_csv)),
+        _hydra_override("output_dir_phase", str(eval_dir)),
+    ])
+
+    merged_train_path = val_dir / "merged.parquet"
+    merged_eval_path = eval_dir / "merged.parquet"
+
+    # CG-recall@∞ on val (upper bound for the ranker; logged for parity with
+    # the previous pipeline).
+    upper_bound = cg_recall(
+        pl.read_parquet(merged_train_path),
+        pl.read_parquet(gt_val_path),
+    )
+    log.info(
+        "CG-recall@∞ on val (upper bound for ranker, ×1000 scale): %.2f",
+        upper_bound,
+    )
+
+    # ── 4. Phase 3 — compute features × 2 (labeled train + unlabeled eval) ───
+    features_dir = Path(cfg.features_dir)
+    features_dir.mkdir(parents=True, exist_ok=True)
+    feats_train_path = features_dir / f"{run_id}_train.parquet"
+    feats_eval_path = features_dir / f"{run_id}_eval.parquet"
+
+    common_feat = [
+        _hydra_override("data", cfg.data.size),
+        _hydra_override("run_id", run_id),
+        _hydra_override("artifacts_root", cfg.artifacts_root),
+        _hydra_override("data.root", cfg.data.root),
+        _hydra_override("enable_embed_features", bool(cfg.get("enable_embed_features", True))),
+        _hydra_override("cutoff_ts", train_cutoff_ts),
+    ]
+    _run_phase("scripts/_phases/compute_features.py", common_feat + [
+        _hydra_override("merged_path", str(merged_train_path)),
+        _hydra_override("output_path", str(feats_train_path)),
+        _hydra_override("label_gt_path", str(gt_val_path)),
+    ])
+    _run_phase("scripts/_phases/compute_features.py", common_feat + [
+        _hydra_override("merged_path", str(merged_eval_path)),
+        _hydra_override("output_path", str(feats_eval_path)),
+        # No label_gt_path — eval features are unlabeled; predict only.
+    ])
+
+    # ── 5. In-process: load labeled train features → train ranker ────────────
+    log.info("loading labeled train features ← %s", feats_train_path)
+    labeled = pl.read_parquet(feats_train_path)
+    pos_rate = float(labeled["label"].mean())
+    log.info(
+        "labeled features: %d rows × %d cols | label rate: %.4f (neg_ratio ~%d:1)",
+        len(labeled), len(labeled.columns), pos_rate,
+        int(1 / pos_rate) if pos_rate > 0 else 0,
+    )
+
+    df_train, df_val_ranker = _split_for_ranker(labeled, cfg.seed)
+    log.info("ranker train=%d  val=%d", len(df_train), len(df_val_ranker))
+    del labeled
+
+    ranker = RankerModel(**cfg.ranker)
+    ranker.fit(df_train, df_val_ranker)
+    del df_train, df_val_ranker
+
+    # ── 6. Eval Recall@100 on val + test ─────────────────────────────────────
+    log.info("loading eval features ← %s", feats_eval_path)
+    feats_full = pl.read_parquet(feats_eval_path)
+    log.info(
+        "eval features: %d rows × %d cols",
+        len(feats_full), len(feats_full.columns),
+    )
+
+    gt_val = pl.read_parquet(gt_val_path)
+    gt_test = pl.read_parquet(gt_test_path)
     log.info(
         "val ground truth: %d pairs / %d users; test: %d pairs / %d users",
         len(gt_val), gt_val["uid"].n_unique(),
         len(gt_test), gt_test["uid"].n_unique(),
     )
-
-    # ── 2. Fit / load each CG ────────────────────────────────────────────────
-    # Some CGs (e.g. RecentLikesModel) train on likes, not listens.
-    # cg_cfg.data_source picks which source they get; default = listens.
-    train_max_ts = float(split.train["timestamp"].max())
-    likes_train = (
-        load_likes(path=cfg.data.likes)
-        .filter(pl.col("timestamp") <= train_max_ts)
-    )
-    log.info("likes (train period): %d rows", len(likes_train))
-
-    data_sources = {
-        "listens": split.train,
-        "likes": likes_train,
-    }
-
-    cgs = []
-    for cg_cfg in cfg.candidate_generators:
-        source_name = cg_cfg.get("data_source", "listens")
-        if source_name not in data_sources:
-            raise ValueError(
-                f"unknown data_source '{source_name}' for CG '{cg_cfg.get('name')}'; "
-                f"valid: {list(data_sources)}"
-            )
-        cg = fit_or_load_cg(
-            cg_cfg,
-            data_sources[source_name],
-            size=cfg.data.size,
-            suffix="",
-            force_refit=cfg.force_refit_cg,
-            cache_dir=cfg.cg_cache_dir,
-        )
-        cgs.append(cg)
-
-    # Free training data now that all CGs are fitted — split.train can be large
-    # (e.g. 200M rows on 500m).  gt_val / gt_test are already computed above.
-    del data_sources, split, likes_train
-    gc.collect()
-    log.info("training data freed before candidate generation")
-
-    # ── 3. Generate candidates for BOTH sets while CG models are in memory ───
-    # Generating eval candidates here (instead of after features) lets us delete
-    # all CG models before the expensive features.collect() call, which can save
-    # 20-50 GB on the 500m/5b datasets.
-    val_users_with_gt = gt_val["uid"].unique().to_list()
-    cg_dfs_val = generate_candidates(cgs, val_users_with_gt)
-    cg_dfs_full = generate_candidates(cgs, eval_users)
-
-    cg_names = ",".join(cg.name for cg in cgs)
-    del cgs
-    gc.collect()
-    log.info("CG models freed; proceeding to merge + feature computation")
-
-    # ── 4. Merge → optional dislike filter → cg_recall ───────────────────────
-    merged = merge_candidates(cg_dfs_val)
-    del cg_dfs_val
-
-    merged_full = merge_candidates(cg_dfs_full)
-    del cg_dfs_full
-
-    if cfg.filter_dislikes:
-        # Use only events recorded up to the train cutoff (computed above)
-        # to avoid leaking validation-period information into the offline eval.
-        dislikes_train = (
-            load_dislikes(path=cfg.data.dislikes)
-            .filter(pl.col("timestamp") <= train_max_ts)
-        )
-        undislikes_train = (
-            load_undislikes(path=cfg.data.undislikes)
-            .filter(pl.col("timestamp") <= train_max_ts)
-        )
-        active_dislikes = effective_dislikes(dislikes_train, undislikes_train)
-        log.info(
-            "effective dislikes (train period): %d active / %d raw / %d undislikes",
-            len(active_dislikes), len(dislikes_train), len(undislikes_train),
-        )
-        before = len(merged)
-        merged = apply_exclude_filter(merged, active_dislikes)
-        log.info(
-            "dislike filter: dropped %d / %d candidate rows",
-            before - len(merged), before,
-        )
-        merged_full = apply_exclude_filter(merged_full, active_dislikes)
-
-    upper_bound = cg_recall(merged, gt_val)
-    log.info("CG-recall@∞ on val (upper bound for ranker, ×1000 scale): %.2f", upper_bound)
-
-    # ── 5. Label + features (LazyFrame, train period only via cutoff_ts) ─────
-    labeled = _label_candidates(merged, gt_val)
-    pos_rate = float(labeled["label"].mean())
-    log.info(
-        "label rate: %.4f (neg_ratio ~%d:1, %d rows)",
-        pos_rate, int(1 / pos_rate) if pos_rate > 0 else 0, len(labeled),
-    )
-
-    cutoff_ts = int(train_max_ts)
-    listens_lf = pl.scan_parquet(cfg.data.listens)
-    likes_lf = pl.scan_parquet(cfg.data.likes)
-    dislikes_lf = pl.scan_parquet(cfg.data.dislikes)
-    unlikes_lf = pl.scan_parquet(cfg.data.unlikes)
-    undislikes_lf = pl.scan_parquet(cfg.data.undislikes)
-    artist_map_lf = pl.scan_parquet(cfg.data.artist_item_mapping)
-    album_map_lf = pl.scan_parquet(cfg.data.album_item_mapping)
-
-    log.info("computing features (LazyFrame, cutoff_ts=%d)", cutoff_ts)
-    features_lf = add_features(
-        labeled.lazy(),
-        listens_lf=listens_lf,
-        likes_lf=likes_lf,
-        dislikes_lf=dislikes_lf,
-        unlikes_lf=unlikes_lf,
-        undislikes_lf=undislikes_lf,
-        artist_map_lf=artist_map_lf,
-        album_map_lf=album_map_lf,
-        cutoff_ts=cutoff_ts,
-        embeddings_path=cfg.data.embeddings if cfg.get("enable_embed_features", True) else None,
-    )
-
-    if cfg.cache_features:
-        features_dir = Path(cfg.features_dir)
-        features_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = features_dir / f"{cfg.run_id}_train.parquet"
-        labeled = features_lf.collect()
-        log.info("caching labeled features → %s", cache_path)
-        labeled.write_parquet(str(cache_path), compression="zstd")
-    else:
-        labeled = features_lf.collect()
-    log.info("labeled+features: %d rows × %d cols", len(labeled), len(labeled.columns))
-
-    # ── 6. Train ranker ──────────────────────────────────────────────────────
-    df_train, df_val_ranker = _split_for_ranker(labeled, cfg.seed)
-    log.info("ranker train=%d  val=%d", len(df_train), len(df_val_ranker))
-
-    ranker = RankerModel(**cfg.ranker)
-    ranker.fit(df_train, df_val_ranker)
-
-    # ── 7. Eval Recall@100 on val + test ─────────────────────────────────────
-    # merged_full was generated and filtered in step 3/4 above.
-    log.info("computing features for full eval set")
-    feats_full_lf = add_features(
-        merged_full.lazy(),
-        listens_lf=listens_lf,
-        likes_lf=likes_lf,
-        dislikes_lf=dislikes_lf,
-        unlikes_lf=unlikes_lf,
-        undislikes_lf=undislikes_lf,
-        artist_map_lf=artist_map_lf,
-        album_map_lf=album_map_lf,
-        cutoff_ts=cutoff_ts,
-        embeddings_path=cfg.data.embeddings if cfg.get("enable_embed_features", True) else None,
-    )
-    if cfg.cache_features:
-        features_dir = Path(cfg.features_dir)
-        features_dir.mkdir(parents=True, exist_ok=True)
-        eval_cache_path = features_dir / f"{cfg.run_id}_eval.parquet"
-        feats_full = feats_full_lf.collect()
-        log.info("caching eval features → %s", eval_cache_path)
-        feats_full.write_parquet(str(eval_cache_path), compression="zstd")
-    else:
-        feats_full = feats_full_lf.collect()
-    log.info("full eval features: %d rows × %d cols", len(feats_full), len(feats_full.columns))
 
     preds_val = ranker.predict(feats_full, n=cfg.top_k)
     score_val = recall_at_k(gt_val, preds_val, k=cfg.top_k)
@@ -287,15 +267,15 @@ def main(cfg: DictConfig) -> None:
     score_test = recall_at_k(gt_test, preds_test, k=cfg.top_k)
     log.info("test Recall@%d = %.2f", cfg.top_k, score_test)
 
-    # ── 8. Persist ranker + log results ──────────────────────────────────────
+    # ── 7. Persist ranker + log results ──────────────────────────────────────
     ranker_dir = Path(cfg.ranker_dir)
     ranker_dir.mkdir(parents=True, exist_ok=True)
-    run_id = str(cfg.run_id)
     ranker_path = ranker_dir / f"ranker_{run_id}.pkl"
     with open(ranker_path, "wb") as f:
         pickle.dump(ranker, f)
     log.info("ranker saved to %s", ranker_path)
 
+    cg_names = ",".join(c.get("name") for c in cfg.candidate_generators)
     results_path = Path(cfg.output_dir) / "results.csv"
     run_id_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     for split_name, score in [("val", score_val), ("test", score_test)]:
@@ -309,7 +289,7 @@ def main(cfg: DictConfig) -> None:
         })
     log.info("results appended to %s", results_path)
 
-    # ── 9. Optional feature importance ───────────────────────────────────────
+    # ── 8. Optional feature importance ───────────────────────────────────────
     if cfg.compute_feature_importance:
         try:
             fi = ranker.feature_importance(prettified=True)
