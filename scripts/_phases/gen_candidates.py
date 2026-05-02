@@ -37,7 +37,11 @@ log = logging.getLogger(__name__)
 @hydra.main(config_path="../../configs", config_name="ranker", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     setup_logging()
-    log.info("gen_candidates config:\n%s", OmegaConf.to_yaml(cfg))
+    log.info(
+        "gen_candidates phase: data=%s run_id=%s users_source=%s output_dir=%s filter_dislikes=%s dislike_cutoff_ts=%s",
+        cfg.data.size, cfg.run_id, cfg.users_source, cfg.output_dir_phase,
+        cfg.filter_dislikes, cfg.dislike_cutoff_ts,
+    )
 
     users_source = cfg.get("users_source")
     if users_source is None:

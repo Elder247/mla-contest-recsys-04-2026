@@ -33,7 +33,12 @@ log = logging.getLogger(__name__)
 @hydra.main(config_path="../../configs", config_name="ranker", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     setup_logging()
-    log.info("compute_features config:\n%s", OmegaConf.to_yaml(cfg))
+    log.info(
+        "compute_features phase: data=%s run_id=%s cutoff_ts=%s enable_embed_features=%s merged_path=%s output_path=%s label_gt_path=%s",
+        cfg.data.size, cfg.run_id, cfg.cutoff_ts, cfg.enable_embed_features,
+        cfg.merged_path, cfg.output_path, cfg.label_gt_path,
+    )
+
 
     merged_path = cfg.get("merged_path")
     output_path = cfg.get("output_path")

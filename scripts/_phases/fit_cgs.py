@@ -23,7 +23,10 @@ log = logging.getLogger(__name__)
 @hydra.main(config_path="../../configs", config_name="ranker", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     setup_logging()
-    log.info("fit_cgs config:\n%s", OmegaConf.to_yaml(cfg))
+    log.info(
+        "fit_cgs phase: data=%s run_id=%s suffix=%s force_refit_cg=%s train_cutoff_ts=%s",
+        cfg.data.size, cfg.run_id, cfg.suffix, cfg.force_refit_cg, cfg.train_cutoff_ts,
+    )
 
     suffix = cfg.get("suffix", "")
     train_cutoff_ts = cfg.get("train_cutoff_ts", None)
