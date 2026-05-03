@@ -27,3 +27,5 @@ run_id,model,dataset_size,split,score,config_path
 20260501_161523,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn]",50m,test,366.5068,configs/ranker.yaml
 20260502_133306,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn]",50m,val,389.5979,configs/ranker.yaml
 20260502_133306,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn]",50m,test,384.0966,configs/ranker.yaml
+20260503_133728,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn]",500m,val,382.8246,configs/ranker.yaml
+20260503_133728,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn]",500m,test,378.5924,configs/ranker.yaml
