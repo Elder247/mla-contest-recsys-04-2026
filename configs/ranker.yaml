@@ -60,7 +60,7 @@ label_gt_path: null
 candidate_generators:
   - _target_: src.models.pop.DecayPop
     name: decaypop
-    n_cand: 100
+    n_cand: 80
     half_life_units: 518400
 
   - _target_: src.models.als.ALSModel
@@ -69,7 +69,7 @@ candidate_generators:
     iterations: 20
     regularization: 0.01
     alpha: 40.0
-    n_cand: 500
+    n_cand: 350
     high_engagement_weight: 3.0
     mid_engagement_weight: 1.0
     low_engagement_weight: 0.3
@@ -91,7 +91,7 @@ candidate_generators:
     name: artist_pop
     entity: artist
     top_entities: 10
-    n_cand: 100
+    n_cand: 80
     half_life_units: 518400
     data_root: ${data.root}
 
@@ -99,7 +99,7 @@ candidate_generators:
     name: album_pop
     entity: album
     top_entities: 10
-    n_cand: 100
+    n_cand: 80
     half_life_units: 518400
     data_root: ${data.root}
 
@@ -111,7 +111,7 @@ candidate_generators:
 
   - _target_: src.models.audio_knn.AudioEmbedKNNModel
     name: audio_knn
-    n_cand: 100
+    n_cand: 80
     user_history_k: 20
     hnsw_m: 32
     ef_construction: 200

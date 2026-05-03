@@ -61,23 +61,23 @@ class RankerModel:
         log.info("fitting RankerModel: %d features, train=%d rows", len(self._feature_cols), len(df_train))
 
         # GPU YetiRank hard limit: max 1023 candidates per query group.
-        # Cap to 1000 keeping all positives (sort label desc before head).
+        # Cap to 1023 keeping all positives (sort label desc before head).
         if self.task_type.upper() == "GPU":
             df_train = (
                 df_train
                 .sort(["uid", "label"], descending=[False, True])
                 .group_by("uid", maintain_order=True)
-                .head(1000)
+                .head(1023)
             )
             if df_val is not None:
                 df_val = (
                     df_val
                     .sort(["uid", "label"], descending=[False, True])
                     .group_by("uid", maintain_order=True)
-                    .head(1000)
+                    .head(1023)
                 )
             log.info(
-                "GPU mode: capped train to %d rows, val to %d rows (max 1000/user)",
+                "GPU mode: capped train to %d rows, val to %d rows (max 1023/user)",
                 len(df_train), len(df_val) if df_val is not None else 0,
             )
 
