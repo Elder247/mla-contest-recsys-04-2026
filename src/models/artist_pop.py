@@ -40,7 +40,7 @@ class ArtistAlbumPopModel(BaseModel):
         top_entities: int = 10,
         n_cand: int = 100,
         half_life_units: int = _DEFAULT_HALF_LIFE,
-        data_root: str = "data",
+        data_root: str = "/home/astrofimuk/dc-remote/data",
     ):
         if entity not in ("artist", "album"):
             raise ValueError(f"entity must be 'artist' or 'album', got {entity!r}")

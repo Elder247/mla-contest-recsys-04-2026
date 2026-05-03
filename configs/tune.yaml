@@ -1,5 +1,5 @@
 defaults:
-  - data: 50m
+  - data: 500m
   - split: temporal
   - _self_
 
@@ -33,8 +33,8 @@ n_trials_per_cg:
   recent_likes: 25
   artist_pop: 30
   album_pop: 30
-  als: 30
-  itemknn: 25
+  als: 20
+  itemknn: 20
   audio_knn: 20
 
 n_trials_per_phase:

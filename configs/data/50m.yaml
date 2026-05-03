@@ -4,7 +4,7 @@
 #     python -u scripts/train_ranker.py data=50m data.root=/mnt/dc-remote/data
 data:
   size: "50m"
-  root: "data"
+  root: "/home/astrofimuk/dc-remote/data"
   listens: "${data.root}/${data.size}/listens.parquet"
   likes: "${data.root}/${data.size}/likes.parquet"
   dislikes: "${data.root}/${data.size}/dislikes.parquet"

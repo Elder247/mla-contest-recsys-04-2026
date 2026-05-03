@@ -1,0 +1,12 @@
+{
+  "study_name": "cg_artist_pop",
+  "best_value": 332.7541285564141,
+  "best_params": {
+    "top_entities": 28,
+    "half_life_units": 783837
+  },
+  "n_trials": 32,
+  "phase": "cg",
+  "cg_name": "artist_pop",
+  "n_max": 350
+}

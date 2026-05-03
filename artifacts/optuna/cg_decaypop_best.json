@@ -1,0 +1,11 @@
+{
+  "study_name": "cg_decaypop",
+  "best_value": 115.9477927477198,
+  "best_params": {
+    "half_life_units": 106299
+  },
+  "n_trials": 75,
+  "phase": "cg",
+  "cg_name": "decaypop",
+  "n_max": 350
+}

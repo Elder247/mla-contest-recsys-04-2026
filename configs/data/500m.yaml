@@ -2,7 +2,7 @@
 # See configs/data/50m.yaml for the ``data.root`` override convention.
 data:
   size: "500m"
-  root: "data"
+  root: "/home/astrofimuk/dc-remote/data"
   listens: "${data.root}/${data.size}/listens.parquet"
   likes: "${data.root}/${data.size}/likes.parquet"
   dislikes: "${data.root}/${data.size}/dislikes.parquet"
