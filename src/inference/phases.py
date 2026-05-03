@@ -178,7 +178,7 @@ def generate_phase(
     for cg_cfg in cg_cfg_list:
         name = cg_cfg.get("name")
         cg = _load_cg_from_cache(name, size, suffix, cache_dir)
-        n_cand = getattr(cg, "n_cand", cg_cfg.get("n_cand", 100))
+        n_cand = cg_cfg.get("n_cand", getattr(cg, "n_cand", 100))
         log.info(
             "CG '%s': generating top-%d for %d users",
             name, n_cand, len(eval_users),
