@@ -259,12 +259,10 @@ def main(cfg: DictConfig) -> None:
         len(gt_test), gt_test["uid"].n_unique(),
     )
 
-    preds_val = ranker.predict(feats_full, n=cfg.top_k)
-    score_val = recall_at_k(gt_val, preds_val, k=cfg.top_k)
+    preds = ranker.predict(feats_full, n=cfg.top_k)
+    score_val = recall_at_k(gt_val, preds, k=cfg.top_k)
     log.info("val  Recall@%d = %.2f", cfg.top_k, score_val)
-
-    preds_test = ranker.predict(feats_full, n=cfg.top_k)
-    score_test = recall_at_k(gt_test, preds_test, k=cfg.top_k)
+    score_test = recall_at_k(gt_test, preds, k=cfg.top_k)
     log.info("test Recall@%d = %.2f", cfg.top_k, score_test)
 
     # ── 7. Persist ranker + log results ──────────────────────────────────────

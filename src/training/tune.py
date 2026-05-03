@@ -46,6 +46,24 @@ def make_storage(path: str | Path) -> str:
     return f"sqlite:///{p.resolve()}"
 
 
+def _maybe_enqueue_baseline(study: optuna.Study, baseline_params: dict | None) -> None:
+    """Enqueue baseline params as the next trial when the study is fresh.
+
+    No-op when ``baseline_params`` is None or the study already has trials
+    (avoids re-running baseline on study resume).
+    """
+    if not baseline_params:
+        return
+    if len(study.trials) > 0:
+        log.info(
+            "skipping baseline enqueue: study has %d existing trials",
+            len(study.trials),
+        )
+        return
+    study.enqueue_trial(dict(baseline_params))
+    log.info("enqueued baseline trial: %s", dict(baseline_params))
+
+
 # ---------------------------------------------------------------------------
 # B1 — Candidate generator tuning
 # ---------------------------------------------------------------------------
@@ -62,6 +80,7 @@ def tune_candidate_generator(
     sampler: optuna.samplers.BaseSampler | None = None,
     seed: int = 42,
     show_progress_bar: bool = False,
+    baseline_params: dict | None = None,
 ) -> optuna.Study:
     """Tune a single CG by **Recall@N_max** standalone (no ranker).
 
@@ -95,6 +114,7 @@ def tune_candidate_generator(
         sampler=sampler or optuna.samplers.TPESampler(seed=seed),
         direction="maximize",
     )
+    _maybe_enqueue_baseline(study, baseline_params)
     log.info(
         "tune_candidate_generator: %d trials, n_max=%d, storage=%s",
         n_trials, n_max, storage,
@@ -119,6 +139,7 @@ def tune_ranker(
     sampler: optuna.samplers.BaseSampler | None = None,
     seed: int = 42,
     show_progress_bar: bool = False,
+    baseline_params: dict | None = None,
 ) -> optuna.Study:
     """Tune CatBoost YetiRank hyperparams on fixed candidates+features.
 
@@ -154,6 +175,7 @@ def tune_ranker(
         sampler=sampler or optuna.samplers.TPESampler(seed=seed),
         direction="maximize",
     )
+    _maybe_enqueue_baseline(study, baseline_params)
     log.info("tune_ranker: %d trials, k=%d, storage=%s", n_trials, k, storage)
     study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
     return study
@@ -187,6 +209,7 @@ def tune_n_cand(
     sampler: optuna.samplers.BaseSampler | None = None,
     seed: int = 42,
     show_progress_bar: bool = False,
+    baseline_params: dict | None = None,
 ) -> optuna.Study:
     """Tune per-CG ``n_cand`` allocation under a total-budget constraint.
 
@@ -249,6 +272,7 @@ def tune_n_cand(
         sampler=sampler or optuna.samplers.TPESampler(seed=seed),
         direction="maximize",
     )
+    _maybe_enqueue_baseline(study, baseline_params)
     log.info(
         "tune_n_cand: %d trials, %d CGs, n_max=%d, budget=%d, storage=%s",
         n_trials, len(cg_names), n_max_per_cg, total_budget, storage,
@@ -313,5 +337,7 @@ def default_artist_album_pop_space(trial: optuna.Trial) -> dict:
 def default_audio_knn_space(trial: optuna.Trial) -> dict:
     return dict(
         user_history_k=trial.suggest_int("user_history_k", 5, 50),
-        ef_search=trial.suggest_int("ef_search", 16, 256, log=True),
+        hnsw_m=trial.suggest_int("hnsw_m", 16, 64),
+        ef_construction=trial.suggest_int("ef_construction", 100, 400),
+        ef_search=trial.suggest_int("ef_search", 32, 128),
     )

@@ -9,20 +9,46 @@ seed: 42
 phase: ranker
 
 # Common
-n_trials: 50
-artifacts_root: artifacts                # override to redirect study + cache reads
-storage_dir: ${artifacts_root}/optuna    # sqlite storage will go here
-study_name: ${phase}                     # default; override per-run for parallel studies
-top_k: 100                               # contest k
-run_id: "008"                            # used to locate cached features / ranker pkl
+# Set to null so per-CG / per-phase defaults below kick in. Override on CLI
+# (eg. ``n_trials=3``) to force-run an exact count for smoke tests / debug.
+n_trials: null
+artifacts_root: artifacts                 # override to redirect study + cache reads
+storage_dir: ${artifacts_root}/optuna     # sqlite storage will go here
+top_k: 100                                # contest k
+run_id: "008"                             # used to locate cached features / ranker pkl
+
+# Default study_name = ${phase} for ranker / n_cand and ``cg_${cg_name}`` for cg.
+# Override on CLI for parallel studies (eg. ``study_name=cg_als_v2``).
+study_name: ${phase}
+
+# Per-phase n_trials overrides (Phase 1A / 1B / 1C from misty-plotting plan):
+#   - 8 CGs run sequentially via ``phase=cg cg_name=...``; trials adjusted to
+#     fit each CG's fit cost on 50m.
+#   - n_cand budget search has a tiny effective space (zero re-fit per trial),
+#     so 15 trials is plenty.
+#   - ranker hyperparams: 25 trials × 3 min on GPU = ~75 min.
+n_trials_per_cg:
+  decaypop: 25
+  repeat: 25
+  recent_likes: 25
+  artist_pop: 30
+  album_pop: 30
+  als: 30
+  itemknn: 25
+  audio_knn: 20
+
+n_trials_per_phase:
+  ranker: 25
+  n_cand: 15
 
 # ── phase=cg ──────────────────────────────────────────────────────────────
 # CG class is selected by ``cg_name`` (must match one of the supported builders
 # in scripts/tune.py: decaypop, repeat, recent_likes, als, itemknn,
 # artist_pop, album_pop, audio_knn).
 cg_name: decaypop
-data_source: listens                     # "listens" or "likes" (RecentLikes uses likes)
-n_max: 500                               # top-N for the standalone Recall@N_max metric
+data_source: listens                      # "listens" or "likes" (RecentLikes uses likes)
+n_max: 350                                # top-N for the standalone Recall@N_max metric
+                                          # (matches Phase 1B n_max_per_cg)
 
 # ── phase=ranker ──────────────────────────────────────────────────────────
 # Cached feature parquets produced by train_ranker.py with cache_features=true.
@@ -31,8 +57,8 @@ eval_features_path: ${artifacts_root}/features/${run_id}_eval.parquet
 
 # ── phase=n_cand ──────────────────────────────────────────────────────────
 ranker_path: ${artifacts_root}/ranker_${run_id}.pkl
-n_max_per_cg: 500
-total_budget: 1500
+n_max_per_cg: 350                         # Phase 1B n_cand_max
+total_budget: 1500                        # Phase 1B budget (post-dedup capped by GPU 1023)
 budget_step: 25
 cg_names_list: [decaypop, als, repeat, itemknn, artist_pop, album_pop, recent_likes, audio_knn]
 

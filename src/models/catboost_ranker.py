@@ -62,19 +62,31 @@ class RankerModel:
 
         # GPU YetiRank hard limit: max 1023 candidates per query group.
         # Cap to 1023 keeping all positives (sort label desc before head).
+        # Sort negatives by Reciprocal Rank Fusion score (RRF).
         if self.task_type.upper() == "GPU":
+            rank_cols = [c for c in df_train.columns if c.endswith("_rank")]
+            K_RRF = 60
+            rrf_expr = pl.sum_horizontal(*[
+                (1.0 / (K_RRF + pl.col(c))).fill_null(0.0)
+                for c in rank_cols
+            ]).alias("_rrf_score")
+
             df_train = (
                 df_train
-                .sort(["uid", "label"], descending=[False, True])
+                .with_columns(rrf_expr)
+                .sort(["uid", "label", "_rrf_score"], descending=[False, True, True])
                 .group_by("uid", maintain_order=True)
                 .head(1023)
+                .drop("_rrf_score")
             )
             if df_val is not None:
                 df_val = (
                     df_val
-                    .sort(["uid", "label"], descending=[False, True])
+                    .with_columns(rrf_expr)
+                    .sort(["uid", "label", "_rrf_score"], descending=[False, True, True])
                     .group_by("uid", maintain_order=True)
                     .head(1023)
+                    .drop("_rrf_score")
                 )
             log.info(
                 "GPU mode: capped train to %d rows, val to %d rows (max 1023/user)",
