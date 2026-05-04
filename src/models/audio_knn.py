@@ -54,7 +54,7 @@ class AudioEmbedKNNModel(BaseModel):
         ef_construction: int = 200,
         ef_search: int = 64,
         embeddings_path: str | None = None,
-        data_root: str = "data",
+        data_root: str = "/home/astrofimuk/dc-remote/data",
     ):
         self.name = name
         self.n_cand = n_cand

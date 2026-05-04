@@ -324,7 +324,7 @@ def default_als_space(trial: optuna.Trial) -> dict:
 
 
 def default_itemknn_space(trial: optuna.Trial) -> dict:
-    return dict(k=trial.suggest_int("k", 50, 500))
+    return dict(k=trial.suggest_int("k", 1, 100))
 
 
 def default_artist_album_pop_space(trial: optuna.Trial) -> dict:

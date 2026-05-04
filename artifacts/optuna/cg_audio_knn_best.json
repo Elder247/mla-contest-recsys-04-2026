@@ -1,0 +1,14 @@
+{
+  "study_name": "cg_audio_knn",
+  "best_value": 65.60151345650526,
+  "best_params": {
+    "user_history_k": 15,
+    "hnsw_m": 57,
+    "ef_construction": 209,
+    "ef_search": 118
+  },
+  "n_trials": 21,
+  "phase": "cg",
+  "cg_name": "audio_knn",
+  "n_max": 350
+}
