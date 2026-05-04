@@ -53,6 +53,7 @@ from src.training.tune import (
     tune_candidate_generator,
     tune_n_cand,
     tune_ranker,
+    tune_ranker_and_n_cand,
 )
 from src.utils import setup_logging
 
@@ -134,7 +135,7 @@ _CG_SPACE_KEYS = {
 }
 
 _RANKER_SPACE_KEYS = [
-    "iterations", "depth", "learning_rate", "l2_leaf_reg", "early_stopping_rounds",
+    "iterations", "depth", "learning_rate", "l2_leaf_reg",
 ]
 
 
@@ -386,6 +387,80 @@ def _phase_n_cand(cfg: DictConfig, storage: str) -> optuna.Study:
     )
 
 
+def _phase_joint(cfg: DictConfig, storage: str) -> optuna.Study:
+    """Joint ranker + n_cand allocation tuning.
+
+    Reuses the cached features parquets produced by train_ranker.py with
+    ``cache_features=true``. Each CG must have generated n_cand=cfg.n_max_per_cg
+    candidates (default 350); the per-trial keep mask emulates smaller n_cand
+    by filtering rows with ``{name}_rank > n_cand_per_cg``.
+    """
+    labeled_path = Path(cfg.labeled_features_path)
+    eval_path = Path(cfg.eval_features_path)
+    if not labeled_path.exists():
+        raise FileNotFoundError(
+            f"labeled features not cached: {labeled_path}\n"
+            f"Run: python -u scripts/train_ranker.py data={cfg.data.size} "
+            f"run_id={cfg.run_id} cache_features=true"
+        )
+    if not eval_path.exists():
+        raise FileNotFoundError(
+            f"eval features not cached: {eval_path}\n"
+            f"Run train_ranker.py with cache_features=true (same run_id)"
+        )
+
+    log.info("loading cached features: labeled=%s eval=%s", labeled_path, eval_path)
+    labeled_df = pl.read_parquet(labeled_path)
+    eval_features_df = pl.read_parquet(eval_path)
+    log.info(
+        "labeled=%d×%d  eval=%d×%d",
+        len(labeled_df), len(labeled_df.columns),
+        len(eval_features_df), len(eval_features_df.columns),
+    )
+
+    gt_val = _load_gt_val(cfg)
+    log.info("gt_val: %d pairs / %d users", len(gt_val), gt_val["uid"].n_unique())
+
+    cg_names = list(cfg.cg_names_list)
+
+    # Baseline: current ranker.yaml params (ranker block + per-CG n_cand).
+    # n_cand baseline must be clamped to multiples of n_cand_step within
+    # [n_cand_min, n_max_per_cg], otherwise enqueue_trial rejects it.
+    step = int(cfg.budget_step)
+    lo = int(cfg.get("n_cand_min", 25))
+    hi = int(cfg.n_max_per_cg)
+
+    def _snap(v: int) -> int:
+        v = max(lo, min(hi, int(v)))
+        # Round to nearest multiple of step within [lo, hi].
+        r = lo + round((v - lo) / step) * step
+        return max(lo, min(hi, r))
+
+    baseline = {**_baseline_for_ranker()}
+    for k, v in _baseline_for_n_cand(cg_names).items():
+        baseline[k] = _snap(v)
+
+    return tune_ranker_and_n_cand(
+        labeled_df=labeled_df,
+        eval_features_df=eval_features_df,
+        gt_val=gt_val,
+        cg_names=cg_names,
+        n_max_per_cg=int(cfg.n_max_per_cg),
+        total_budget=int(cfg.total_budget),
+        n_trials=_resolve_n_trials(cfg),
+        k=cfg.top_k,
+        n_cand_step=step,
+        n_cand_min=lo,
+        early_stopping_rounds=int(cfg.get("early_stopping_rounds", 150)),
+        task_type=str(cfg.get("task_type", "GPU")),
+        devices=cfg.get("devices", "0"),
+        study_name=cfg.study_name,
+        storage=storage,
+        seed=cfg.seed,
+        baseline_params=baseline,
+    )
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 
@@ -408,8 +483,12 @@ def main(cfg: DictConfig) -> None:
         study = _phase_ranker(cfg, storage)
     elif cfg.phase == "n_cand":
         study = _phase_n_cand(cfg, storage)
+    elif cfg.phase == "joint":
+        study = _phase_joint(cfg, storage)
     else:
-        raise ValueError(f"phase must be 'cg' | 'ranker' | 'n_cand', got '{cfg.phase}'")
+        raise ValueError(
+            f"phase must be 'cg' | 'ranker' | 'n_cand' | 'joint', got '{cfg.phase}'"
+        )
 
     log.info("=" * 70)
     log.info("study '%s' done: %d trials", cfg.study_name, len(study.trials))
@@ -428,6 +507,11 @@ def main(cfg: DictConfig) -> None:
     elif cfg.phase == "n_cand":
         extra["total_budget"] = int(cfg.total_budget)
         extra["n_max_per_cg"] = int(cfg.n_max_per_cg)
+    elif cfg.phase == "joint":
+        extra["total_budget"] = int(cfg.total_budget)
+        extra["n_max_per_cg"] = int(cfg.n_max_per_cg)
+        extra["cg_names"] = list(cfg.cg_names_list)
+        extra["early_stopping_rounds"] = int(cfg.get("early_stopping_rounds", 150))
     _save_best_json(
         study,
         Path(cfg.storage_dir) / f"{cfg.study_name}_best.json",

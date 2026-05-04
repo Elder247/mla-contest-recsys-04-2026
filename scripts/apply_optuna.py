@@ -86,15 +86,21 @@ def main() -> None:
     for cg_block in cfg.candidate_generators:
         _apply_cg_best(cg_block, optuna_dir)
 
-    # 1B — n_cand allocation
-    log.info("--- Phase 1B: n_cand allocation ---")
-    n_cand_best = _load_best(optuna_dir / "n_cand_best.json")
-    if n_cand_best and "best_params" in n_cand_best:
+    # 1B+1C — joint ranker + n_cand has priority over separate phases.
+    # joint_best.json contains both ``n_cand_{name}`` and ranker keys
+    # (iterations, depth, learning_rate, l2_leaf_reg). When present, use it
+    # exclusively and skip the legacy separate-phase JSONs.
+    joint_best = _load_best(optuna_dir / "joint_best.json")
+    if joint_best and "best_params" in joint_best:
+        log.info("--- Phase 1B+1C: joint ranker + n_cand (from joint_best.json) ---")
+        params = joint_best["best_params"]
+
+        # n_cand allocation
         for cg_block in cfg.candidate_generators:
             name = cg_block.get("name")
             key = f"n_cand_{name}"
-            if key in n_cand_best["best_params"]:
-                v = int(n_cand_best["best_params"][key])
+            if key in params:
+                v = int(params[key])
                 if v <= 0:
                     log.warning(
                         "  %s.n_cand: optuna selected 0 — keeping baseline (%s)",
@@ -107,15 +113,45 @@ def main() -> None:
         total = sum(int(cg.get("n_cand", 0)) for cg in cfg.candidate_generators)
         log.info("  total n_cand budget: %d", total)
 
-    # 1C — ranker hyperparams
-    log.info("--- Phase 1C: ranker hyperparams ---")
-    ranker_best = _load_best(optuna_dir / "ranker_best.json")
-    if ranker_best and "best_params" in ranker_best:
-        for k, v in ranker_best["best_params"].items():
+        # Ranker hyperparams (only those that exist in cfg.ranker — joint
+        # study omits early_stopping_rounds; keep ranker.yaml's value).
+        for k, v in params.items():
+            if k.startswith("n_cand_"):
+                continue
             if k in cfg.ranker:
                 old = cfg.ranker[k]
                 cfg.ranker[k] = v
                 log.info("  ranker.%s: %s → %s", k, old, v)
+    else:
+        # Legacy: separate n_cand_best.json + ranker_best.json
+        log.info("--- Phase 1B: n_cand allocation ---")
+        n_cand_best = _load_best(optuna_dir / "n_cand_best.json")
+        if n_cand_best and "best_params" in n_cand_best:
+            for cg_block in cfg.candidate_generators:
+                name = cg_block.get("name")
+                key = f"n_cand_{name}"
+                if key in n_cand_best["best_params"]:
+                    v = int(n_cand_best["best_params"][key])
+                    if v <= 0:
+                        log.warning(
+                            "  %s.n_cand: optuna selected 0 — keeping baseline (%s)",
+                            name, cg_block.get("n_cand"),
+                        )
+                        continue
+                    old = cg_block.get("n_cand")
+                    cg_block["n_cand"] = v
+                    log.info("  %s.n_cand: %s → %s", name, old, v)
+            total = sum(int(cg.get("n_cand", 0)) for cg in cfg.candidate_generators)
+            log.info("  total n_cand budget: %d", total)
+
+        log.info("--- Phase 1C: ranker hyperparams ---")
+        ranker_best = _load_best(optuna_dir / "ranker_best.json")
+        if ranker_best and "best_params" in ranker_best:
+            for k, v in ranker_best["best_params"].items():
+                if k in cfg.ranker:
+                    old = cfg.ranker[k]
+                    cfg.ranker[k] = v
+                    log.info("  ranker.%s: %s → %s", k, old, v)
 
     # Write with a header comment so it's clear this file is generated
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -5,7 +5,11 @@ defaults:
 
 seed: 42
 
-# Which surface to tune: cg | ranker | n_cand
+# Which surface to tune: cg | ranker | n_cand | joint
+# - cg:      single CG by Recall@n_max (coverage proxy)
+# - ranker:  CatBoost hyperparams on cached features (no n_cand search)
+# - n_cand:  per-CG n_cand allocation, no ranker refit
+# - joint:   ranker + n_cand jointly, refits ranker per trial. Recommended.
 phase: ranker
 
 # Common
@@ -40,6 +44,7 @@ n_trials_per_cg:
 n_trials_per_phase:
   ranker: 25
   n_cand: 15
+  joint: 100
 
 # ── phase=cg ──────────────────────────────────────────────────────────────
 # CG class is selected by ``cg_name`` (must match one of the supported builders
@@ -55,12 +60,22 @@ n_max: 350                                # top-N for the standalone Recall@N_ma
 labeled_features_path: ${artifacts_root}/features/${run_id}_train.parquet
 eval_features_path: ${artifacts_root}/features/${run_id}_eval.parquet
 
-# ── phase=n_cand ──────────────────────────────────────────────────────────
+# ── phase=n_cand / joint ──────────────────────────────────────────────────
+# Both phases use the same per-CG knobs. ``joint`` additionally refits the
+# CatBoost ranker per trial on the filtered training pool.
 ranker_path: ${artifacts_root}/ranker_${run_id}.pkl
-n_max_per_cg: 350                         # Phase 1B n_cand_max
-total_budget: 1500                        # Phase 1B budget (post-dedup capped by GPU 1023)
-budget_step: 25
+n_max_per_cg: 350                         # must equal cg.n_cand used to build cached features
+total_budget: 1600                        # soft cap on sum(n_cand). Post-dedup ~1000-1100/user → mostly fits GPU 1023; RRF trims the rest
+budget_step: 25                           # also used as suggest_int step for n_cand_*
+n_cand_min: 25                            # joint phase only — lower bound on per-CG n_cand
 cg_names_list: [decaypop, als, repeat, itemknn, artist_pop, album_pop, recent_likes, audio_knn]
+
+# joint-only: ranker training on GPU. early_stopping_rounds is fixed (not
+# sampled) to keep the search dimension low. Override on CLI for CPU-only
+# smoke tests: ``task_type=CPU devices=null``.
+task_type: GPU
+devices: "0"
+early_stopping_rounds: 150
 
 hydra:
   output_subdir: null

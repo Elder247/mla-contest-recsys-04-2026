@@ -282,17 +282,152 @@ def tune_n_cand(
 
 
 # ---------------------------------------------------------------------------
+# B4 — Joint ranker + n_cand allocation tuning
+# ---------------------------------------------------------------------------
+
+def tune_ranker_and_n_cand(
+    labeled_df: pl.DataFrame,
+    eval_features_df: pl.DataFrame,
+    gt_val: pl.DataFrame,
+    cg_names: list[str],
+    n_max_per_cg: int,
+    total_budget: int,
+    n_trials: int,
+    ranker_space: Callable[[optuna.Trial], dict] | None = None,
+    k: int = 100,
+    n_cand_step: int = 25,
+    n_cand_min: int = 25,
+    early_stopping_rounds: int = 150,
+    task_type: str = "GPU",
+    devices: str | None = "0",
+    study_name: str | None = None,
+    storage: str | None = None,
+    sampler: optuna.samplers.BaseSampler | None = None,
+    seed: int = 42,
+    show_progress_bar: bool = False,
+    baseline_params: dict | None = None,
+) -> optuna.Study:
+    """Tune CatBoost YetiRank hyperparams *and* per-CG n_cand allocation jointly.
+
+    Each trial:
+      1. Samples ranker params (via ``ranker_space``) and per-CG n_cand
+         (uniform int with ``n_cand_step``, range ``[n_cand_min, n_max_per_cg]``).
+      2. Skips trial (returns 0.0) if ``sum(n_cand) > total_budget``.
+      3. Builds a row-level keep mask: a row survives iff at least one CG has
+         ``{name}_rank IS NOT NULL AND {name}_rank <= n_cand_per_cg``.
+      4. Filters both ``labeled_df`` and ``eval_features_df`` with the same mask
+         — this emulates "what if each CG had been called with n_cand_per_cg".
+      5. Refits the ranker on the filtered training pool and computes
+         ``Recall@k`` on the filtered eval pool against ``gt_val``.
+
+    The keep-mask correctness assumes each CG's ``{name}_rank`` is the true
+    top-by-score order at any N (i.e. CG outputs are deterministic with
+    monotonic top-k). All current 8 CGs satisfy this with fixed seeds. If a
+    new CG with stochastic top-k truncation is added, this function must be
+    revisited.
+
+    Positives (label=1) whose only contributing CG gets a small n_cand will
+    be dropped from the training pool — this is the correct emulation of
+    inference-time behaviour.
+
+    Args:
+        labeled_df: cached training features w/ ``label`` column. Each CG
+            must have generated ``n_cand=n_max_per_cg`` candidates.
+        eval_features_df: cached eval features (no label). Same n_max.
+        cg_names: list of CG names whose budgets to optimise; must match
+            ``{name}_rank`` columns in both DataFrames.
+        n_max_per_cg: must equal the n_cand used to generate the cached
+            features; sets the upper bound on n_cand_per_cg.
+        total_budget: soft cap on sum(n_cand). Trials over budget return 0.
+        early_stopping_rounds: fixed (not sampled) — passed to RankerModel.
+        task_type / devices: passed to RankerModel; default "GPU"/"0".
+    """
+    ranker_space = ranker_space or default_ranker_space
+
+    # Validate {name}_rank columns up-front so we fail fast, not per-trial.
+    rank_cols = [f"{name}_rank" for name in cg_names]
+    missing_labeled = [c for c in rank_cols if c not in labeled_df.columns]
+    missing_eval = [c for c in rank_cols if c not in eval_features_df.columns]
+    if missing_labeled:
+        raise ValueError(
+            f"tune_ranker_and_n_cand: labeled_df missing {missing_labeled}; "
+            f"got {list(labeled_df.columns)}"
+        )
+    if missing_eval:
+        raise ValueError(
+            f"tune_ranker_and_n_cand: eval_features_df missing {missing_eval}; "
+            f"got {list(eval_features_df.columns)}"
+        )
+
+    def objective(trial: optuna.Trial) -> float:
+        ranker_params = ranker_space(trial)
+        n_cands = {
+            name: trial.suggest_int(
+                f"n_cand_{name}", n_cand_min, n_max_per_cg, step=n_cand_step,
+            )
+            for name in cg_names
+        }
+        if sum(n_cands.values()) > total_budget:
+            return 0.0  # soft penalty — over budget
+
+        keep_expr = pl.lit(False)
+        for name, c in n_cands.items():
+            rc = f"{name}_rank"
+            keep_expr = keep_expr | (
+                pl.col(rc).is_not_null() & (pl.col(rc) <= c)
+            )
+
+        labeled_f = labeled_df.filter(keep_expr)
+        eval_f = eval_features_df.filter(keep_expr)
+        if len(labeled_f) == 0 or len(eval_f) == 0:
+            return 0.0
+
+        df_tr, df_va = _split_for_ranker(labeled_f, seed=seed)
+        ranker = RankerModel(
+            **ranker_params,
+            random_state=seed,
+            early_stopping_rounds=early_stopping_rounds,
+            task_type=task_type,
+            devices=devices,
+        )
+        ranker.fit(df_tr, df_va)
+        preds = ranker.predict(eval_f, n=k).rename({"ranker_score": "score"})
+        return recall_at_k(gt_val, preds, k=k)
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=storage is not None,
+        sampler=sampler or optuna.samplers.TPESampler(seed=seed, multivariate=True),
+        direction="maximize",
+    )
+    _maybe_enqueue_baseline(study, baseline_params)
+    log.info(
+        "tune_ranker_and_n_cand: %d trials, %d CGs, n_max=%d, budget=%d, "
+        "task_type=%s, storage=%s",
+        n_trials, len(cg_names), n_max_per_cg, total_budget, task_type, storage,
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
+    return study
+
+
+# ---------------------------------------------------------------------------
 # Default search spaces (per docs/roadmap.md §D.2)
 # ---------------------------------------------------------------------------
 
 def default_ranker_space(trial: optuna.Trial) -> dict:
-    """CatBoost YetiRank hyperparam space — Phase D.2 ranges."""
+    """CatBoost YetiRank hyperparam space.
+
+    early_stopping_rounds is **not** sampled here — it is fixed at the call
+    site (e.g. ``RankerModel(early_stopping_rounds=150, ...)``) to keep the
+    Optuna search dimension lower. Past tuning showed best ES in 100-200
+    range with little sensitivity, so fixing 150 is a safe default.
+    """
     return dict(
-        iterations=trial.suggest_int("iterations", 500, 3000, step=250),
-        depth=trial.suggest_int("depth", 4, 10),
-        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-        l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 0.5, 10.0, log=True),
-        early_stopping_rounds=trial.suggest_int("early_stopping_rounds", 50, 200, step=50),
+        iterations=trial.suggest_int("iterations", 1500, 4000, step=250),
+        depth=trial.suggest_int("depth", 4, 8),
+        learning_rate=trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
+        l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
     )
 
 
@@ -314,10 +449,10 @@ def default_recent_likes_space(trial: optuna.Trial) -> dict:
 
 def default_als_space(trial: optuna.Trial) -> dict:
     return dict(
-        factors=trial.suggest_int("factors", 64, 512, log=True),
+        factors=trial.suggest_int("factors", 128, 1024, log=True),
         iterations=trial.suggest_int("iterations", 10, 30),
-        regularization=trial.suggest_float("regularization", 1e-3, 1.0, log=True),
-        alpha=trial.suggest_float("alpha", 1.0, 100.0, log=True),
+        regularization=trial.suggest_float("regularization", 1e-4, 1.0, log=True),
+        alpha=trial.suggest_float("alpha", 0.5, 100.0, log=True),
         low_engagement_weight=trial.suggest_float("low_engagement_weight", 0.0, 0.5),
         high_engagement_weight=trial.suggest_float("high_engagement_weight", 1.5, 5.0),
     )
