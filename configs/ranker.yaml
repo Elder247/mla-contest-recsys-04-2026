@@ -55,7 +55,7 @@ candidate_generators:
   half_life_units: 877488
 - _target_: src.models.itemknn.ItemKNNModel
   name: itemknn
-  k: 16
+  k: 100
   n_cand: 100
 - _target_: src.models.artist_pop.ArtistAlbumPopModel
   name: artist_pop
