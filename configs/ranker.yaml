@@ -76,6 +76,28 @@ candidate_generators:
   n_cand: 50
   half_life_units: 230003
   data_source: likes
+- _target_: src.models.esasrec.ESASRecModel
+  name: esasrec
+  n_cand: 200
+  emb_dim: 128
+  n_blocks: 2
+  n_heads: 4
+  dropout: 0.3
+  sequence_max_len: 200
+  n_negatives: 16
+  max_epochs: 20
+  lr: 0.001
+  batch_size: 512
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  patience: 5
+  val_pct: 0.1
+  num_workers: 4
+  use_amp: true
+  window_stride: 50
+  infer_batch_size: 64
+  device: auto
+  random_state: 42
 - _target_: src.models.audio_knn.AudioEmbedKNNModel
   name: audio_knn
   n_cand: 200
