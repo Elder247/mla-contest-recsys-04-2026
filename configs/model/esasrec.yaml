@@ -2,11 +2,12 @@ _target_: src.models.esasrec.ESASRecModel
 name: esasrec
 n_cand: 200
 
-# Architecture — larger for 500m (was n_blocks=2, n_heads=4)
-emb_dim: 256
-n_blocks: 4
-n_heads: 8
-dropout: 0.2
+# Architecture — SASRec/antklen-aligned, не BERT4Rec-large
+# с 627k items embeddings уже = 80M params на emb_dim=128 — больше не надо
+emb_dim: 128
+n_blocks: 2
+n_heads: 4
+dropout: 0.3            # SASRec paper: 0.5 для small; 0.3 — компромисс на 500m
 sequence_max_len: 200
 
 # Training — optimized for A100
@@ -25,9 +26,9 @@ val_pct: 0.1
 num_workers: 4         # was 0; parallel prefetch prevents GPU starvation
 use_amp: true          # BF16 autocast on CUDA: halves VRAM, ~2× speedup on A100
 
-# Sliding window — null = last sequence only (fast smoke-test on 50m)
-# Set 50-100 on server to use full history instead of just the tail
-window_stride: null
+# Sliding window — обязательно ≥1 для нормального обучения. null даёт 1 sample/user
+# (на 9k users = 18 batches/epoch, недообучение гарантировано).
+window_stride: 50
 
 # Inference — decoupled from batch_size to avoid OOM on all-item scoring
 # 64 × 9.4M items × 4B = 2.4 GB per batch (safe on any A100)

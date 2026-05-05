@@ -76,16 +76,23 @@ class _SASRec(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_blocks)
 
     def forward(self, seq: torch.Tensor) -> torch.Tensor:
-        """seq: (B, L) int64 → hidden: (B, L, D) float32."""
+        """seq: (B, L) int64 → hidden: (B, L, D) float32.
+
+        Использует ТОЛЬКО causal mask, без key_padding_mask. С left-padding
+        query на early-position имеет все keys тоже padded (causal+pad);
+        softmax(all -inf) = NaN, который через residual распространяется на
+        non-padded позиции в следующих блоках. Без key_padding_mask padded
+        keys участвуют в attention с non-zero pos_emb → бессмысленный, но
+        non-NaN output. Padded позиции отсекаются в loss через non_pad mask.
+        """
         B, L = seq.shape
         pos = torch.arange(L, device=seq.device).unsqueeze(0).expand(B, L)
         x = self.item_emb(seq) + self.pos_emb(pos)
         x = self.norm_in(self.dropout(x))
-        pad_mask = seq == 0  # (B, L) — True means pad / ignore
         causal_mask = torch.triu(
             torch.ones(L, L, dtype=torch.bool, device=seq.device), diagonal=1,
         )
-        out = self.encoder(x, mask=causal_mask, src_key_padding_mask=pad_mask)
+        out = self.encoder(x, mask=causal_mask)
         return self.norm_out(out)
 
     def all_item_scores(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -306,8 +313,8 @@ class ESASRecModel(BaseModel):
 
         # Flat int32 numpy array split by lengths — 7× less RAM than Python list[list[int]]
         flat: np.ndarray = seq_df["tokens"].explode().cast(pl.Int32).to_numpy()
-        lengths: np.ndarray = seq_df["tokens"].list.len().to_numpy()
-        offsets = np.concatenate([[0], np.cumsum(lengths)])
+        lengths: np.ndarray = seq_df["tokens"].list.len().to_numpy().astype(np.int64)
+        offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
         all_uid: np.ndarray = seq_df["uid"].to_numpy()
 
         sequences: list[np.ndarray] = []
@@ -419,7 +426,9 @@ class ESASRecModel(BaseModel):
 
                     pos_loss = -torch.nn.functional.logsigmoid(pos_score)
                     neg_loss = -torch.nn.functional.logsigmoid(-neg_score).mean(-1)
-                    loss_per = (pos_loss + neg_loss) * non_pad.float()
+                    # masked_fill, не multiply: NaN на padded позициях (от causal-attn
+                    # с all-padded keys) НЕ распространяется через 0 → правильный mean
+                    loss_per = (pos_loss + neg_loss).masked_fill(~non_pad, 0.0)
                     loss = loss_per.sum() / non_pad.float().sum().clamp(min=1.0)
 
                 loss.backward()
@@ -455,7 +464,7 @@ class ESASRecModel(BaseModel):
                         neg_score = (hidden.unsqueeze(2) * neg_emb).sum(-1)
                         pos_loss = -torch.nn.functional.logsigmoid(pos_score)
                         neg_loss = -torch.nn.functional.logsigmoid(-neg_score).mean(-1)
-                        loss_per = (pos_loss + neg_loss) * non_pad.float()
+                        loss_per = (pos_loss + neg_loss).masked_fill(~non_pad, 0.0)
                         vloss = loss_per.sum() / non_pad.float().sum().clamp(min=1.0)
                     val_loss_sum += float(vloss.item())
                     val_steps += 1
@@ -466,21 +475,29 @@ class ESASRecModel(BaseModel):
                 epoch + 1, self.max_epochs, avg_train, avg_val,
             )
 
-            if avg_val < best_val_loss:
+            # NaN-safe: avg_val=NaN не пройдёт <, но и не считается улучшением
+            if np.isfinite(avg_val) and avg_val < best_val_loss:
                 best_val_loss = avg_val
                 patience_counter = 0
                 best_state = {k: v.cpu().clone() for k, v in sasrec.state_dict().items()}
             else:
+                if not np.isfinite(avg_val):
+                    log.warning("ESASRec epoch %d: val_loss is NaN/inf, не обновляем checkpoint", epoch + 1)
                 patience_counter += 1
                 if patience_counter >= self.patience:
                     log.info("ESASRec early stopping at epoch %d", epoch + 1)
                     break
 
-        # Restore best checkpoint
+        # Restore best checkpoint (или оставить final state, если все эпохи дали NaN)
         if best_state is not None:
             sasrec.load_state_dict(best_state)
             sasrec.to(device)
             log.info("ESASRec: restored best checkpoint (val_loss=%.4f)", best_val_loss)
+        else:
+            log.warning(
+                "ESASRec: no best checkpoint saved (val_loss was always NaN/inf); "
+                "keeping final-epoch weights"
+            )
 
         sasrec.eval()
         self._model = model
@@ -527,9 +544,11 @@ class ESASRecModel(BaseModel):
                     dtype=torch.bfloat16,
                     enabled=self.use_amp and str(device).startswith("cuda"),
                 ):
-                    hidden = sasrec(x)                       # (B, L, D)
-                    user_h = hidden[:, -1, :].float()        # cast to fp32 for topk stability
-                    scores = sasrec.all_item_scores(user_h)  # (B, n_items)
+                    hidden = sasrec(x)                       # (B, L, D) — bf16 ок
+                # Скоринг и topk — ВНЕ autocast, в fp32: на 627k items в bf16 разница
+                # между близкими scores сжимается → нестабильный ranking в top-200
+                user_h = hidden[:, -1, :].float()
+                scores = sasrec.all_item_scores(user_h)      # fp32 matmul, fp32 scores
                 top_scores, top_idx = torch.topk(scores, top_n, dim=1)
 
                 top_idx_np = top_idx.cpu().numpy() + 1      # back to 1-based token idx
