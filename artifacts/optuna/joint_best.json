@@ -1,0 +1,33 @@
+{
+  "study_name": "joint",
+  "best_value": 413.56194294692295,
+  "best_params": {
+    "iterations": 3500,
+    "depth": 8,
+    "learning_rate": 0.13464262309027955,
+    "l2_leaf_reg": 1.2637954758501069,
+    "n_cand_decaypop": 175,
+    "n_cand_als": 175,
+    "n_cand_repeat": 300,
+    "n_cand_itemknn": 100,
+    "n_cand_artist_pop": 50,
+    "n_cand_album_pop": 150,
+    "n_cand_recent_likes": 50,
+    "n_cand_audio_knn": 200
+  },
+  "n_trials": 142,
+  "phase": "joint",
+  "total_budget": 1600,
+  "n_max_per_cg": 350,
+  "cg_names": [
+    "decaypop",
+    "als",
+    "repeat",
+    "itemknn",
+    "artist_pop",
+    "album_pop",
+    "recent_likes",
+    "audio_knn"
+  ],
+  "early_stopping_rounds": 150
+}

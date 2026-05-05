@@ -1,9 +1,16 @@
 # данные и веса (большие файлы)
 /data/
 artifacts/cg/
+artifacts/candidates/
+artifacts/features/
+artifacts/gt/
 artifacts/*.pt
 artifacts/*.pkl
 artifacts/*.cbm
+
+# Optuna SQLite
+*.db
+!artifacts/optuna/joint.db
 
 # окружение
 .venv/
@@ -32,9 +39,6 @@ catboost_info/
 # numpy кэши (implicit, sklearn)
 *.npy
 *.npz
-
-# Optuna SQLite
-*.db
 
 # покрытие тестов
 .coverage
