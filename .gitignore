@@ -8,10 +8,6 @@ artifacts/*.pt
 artifacts/*.pkl
 artifacts/*.cbm
 
-# Optuna SQLite
-*.db
-!artifacts/optuna/joint.db
-
 # окружение
 .venv/
 __pycache__/
