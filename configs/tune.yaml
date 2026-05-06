@@ -5,11 +5,13 @@ defaults:
 
 seed: 42
 
-# Which surface to tune: cg | ranker | n_cand | joint
-# - cg:      single CG by Recall@n_max (coverage proxy)
-# - ranker:  CatBoost hyperparams on cached features (no n_cand search)
-# - n_cand:  per-CG n_cand allocation, no ranker refit
-# - joint:   ranker + n_cand jointly, refits ranker per trial. Recommended.
+# Which surface to tune: cg | ranker | n_cand | joint | joint_v2
+# - cg:       single CG by Recall@n_max (coverage proxy)
+# - ranker:   CatBoost hyperparams on cached features (no n_cand search)
+# - n_cand:   per-CG n_cand allocation, no ranker refit
+# - joint:    ranker + n_cand jointly, refits ranker per trial.
+# - joint_v2: anti-overfit joint — combined val+test, n_cand_min=0,
+#             no budget penalty, n_max_per_cg=500. Use this on fresh runs.
 phase: ranker
 
 # Common
@@ -45,6 +47,7 @@ n_trials_per_phase:
   ranker: 25
   n_cand: 15
   joint: 100
+  joint_v2: 60
 
 # ── phase=cg ──────────────────────────────────────────────────────────────
 # CG class is selected by ``cg_name`` (must match one of the supported builders
@@ -69,6 +72,28 @@ total_budget: 1600                        # soft cap on sum(n_cand). Post-dedup 
 budget_step: 25                           # also used as suggest_int step for n_cand_*
 n_cand_min: 25                            # joint phase only — lower bound on per-CG n_cand
 cg_names_list: [decaypop, als, repeat, itemknn, artist_pop, album_pop, recent_likes, audio_knn]
+
+# ── phase=joint_v2 overrides ─────────────────────────────────────────────
+# Anti-overfit joint tuning. All keys above (n_max_per_cg, budget_step,
+# n_cand_min, cg_names_list, ranker hyperparams via the joint phase) still
+# apply; on the CLI override the ones below for joint_v2:
+#
+#   python -u scripts/tune.py phase=joint_v2 data=500m \
+#       run_id=v2_features n_max_per_cg=500 n_cand_min=0 \
+#       cg_names_list='[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]' \
+#       study_name=joint_v2 n_trials=60
+#
+# Notes:
+#   - n_cand_min: 0 lets a CG be effectively disabled (vs forced ≥25 in v1).
+#   - n_max_per_cg: 500 — must match the n_cand used to build cached features.
+#     Bump configs/ranker.yaml temporarily to 500 for each CG before running
+#     train_ranker.py with cache_features=true, then revert.
+#   - combined_objective: averages val + test recalls (test is +1 day shifted)
+#     to reduce variance / overfit to a single window.
+#   - n_startup_trials: random exploration before TPE — wider than v1's
+#     default (10) to dilute multi-test bias on a 13-D space (4 ranker + 9 n_cand).
+combined_objective: true
+n_startup_trials: 20
 
 # joint-only: ranker training on GPU. early_stopping_rounds is fixed (not
 # sampled) to keep the search dimension low. Override on CLI for CPU-only

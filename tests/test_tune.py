@@ -18,6 +18,7 @@ from src.training.tune import (
     tune_candidate_generator,
     tune_n_cand,
     tune_ranker,
+    tune_ranker_and_n_cand_v2,
 )
 
 
@@ -149,11 +150,16 @@ def test_tune_ranker_runs_and_uses_custom_space(tiny_labeled, tiny_gt_for_ranker
 
 
 def test_default_ranker_space_returns_required_keys():
-    """The default space must produce the kwargs RankerModel.__init__ expects."""
+    """The default space must produce the kwargs RankerModel.__init__ expects.
+
+    ``early_stopping_rounds`` is intentionally NOT sampled — it's fixed at
+    the call site (see :func:`default_ranker_space` docstring) to keep the
+    Optuna search dimension lower.
+    """
     study = optuna.create_study()
     trial = study.ask()
     params = default_ranker_space(trial)
-    expected = {"iterations", "depth", "learning_rate", "l2_leaf_reg", "early_stopping_rounds"}
+    expected = {"iterations", "depth", "learning_rate", "l2_leaf_reg"}
     assert expected.issubset(params.keys())
 
 
@@ -215,6 +221,82 @@ def test_tune_n_cand_runs_and_obeys_budget():
     bp = study.best_params
     assert bp["n_cand_cg_a"] + bp["n_cand_cg_b"] <= 15
     assert 0 <= study.best_value <= 1000
+
+
+def test_tune_ranker_and_n_cand_v2_combined_objective(tiny_labeled, tiny_gt_for_ranker):
+    """v2 with combined val+test objective + n_cand_min=0 + no budget penalty.
+
+    Adds ``cg_a_rank`` / ``cg_b_rank`` columns derived from feature signs and
+    pretends label==1 rows are val GT, label==0-but-positive-feature are test
+    GT. The point is to verify the function runs end-to-end without crashing
+    and records both ``recall_val`` and ``recall_test`` per trial.
+    """
+    # Inject two synthetic CG ranks: cg_a sees rows where f0>0, cg_b where f1>0,
+    # ranked by descending feature value within each user.
+    labeled = tiny_labeled.with_columns([
+        pl.when(pl.col("f0") > 0)
+        .then(pl.col("f0").rank(descending=True).over("uid").cast(pl.Int32))
+        .otherwise(None)
+        .alias("cg_a_rank"),
+        pl.when(pl.col("f1") > 0)
+        .then(pl.col("f1").rank(descending=True).over("uid").cast(pl.Int32))
+        .otherwise(None)
+        .alias("cg_b_rank"),
+    ])
+    eval_feats = labeled.drop("label")
+    gt_test_synth = (
+        tiny_labeled
+        .filter(pl.col("f0") > 0)
+        .select(["uid", "item_id"])
+    )
+
+    def fast_space(trial: optuna.Trial) -> dict:
+        return dict(
+            iterations=10,
+            depth=trial.suggest_int("depth", 3, 4),
+            learning_rate=0.3,
+            l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 5.0),
+        )
+
+    study = tune_ranker_and_n_cand_v2(
+        labeled_df=labeled,
+        eval_features_df=eval_feats,
+        gt_val=tiny_gt_for_ranker,
+        gt_test=gt_test_synth,
+        cg_names=["cg_a", "cg_b"],
+        n_max_per_cg=10,
+        n_trials=2,
+        ranker_space=fast_space,
+        k=5,
+        n_cand_step=5,
+        early_stopping_rounds=5,
+        task_type="CPU",
+        devices=None,
+    )
+    assert len(study.trials) == 2
+    assert all(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+    # Best is mean of two recalls in [0, 1000].
+    assert 0 <= study.best_value <= 1000
+    # Both per-trial attrs recorded.
+    for t in study.trials:
+        assert "recall_val" in t.user_attrs
+        assert "recall_test" in t.user_attrs
+    # Allowing n_cand_min=0: ensure the suggest range includes 0.
+    bp = study.best_params
+    assert bp["n_cand_cg_a"] >= 0
+    assert bp["n_cand_cg_b"] >= 0
+
+
+def test_tune_ranker_and_n_cand_v2_requires_gt_test_when_combined():
+    with pytest.raises(ValueError, match="gt_test"):
+        tune_ranker_and_n_cand_v2(
+            labeled_df=pl.DataFrame({"uid": [1], "item_id": [1], "label": [1], "cg_a_rank": [1]}),
+            eval_features_df=pl.DataFrame({"uid": [1], "item_id": [1], "cg_a_rank": [1]}),
+            gt_val=pl.DataFrame({"uid": [1], "item_id": [1]}),
+            cg_names=["cg_a"],
+            combined_objective=True,
+            n_trials=1,
+        )
 
 
 def test_tune_n_cand_rejects_missing_columns():

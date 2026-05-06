@@ -412,6 +412,173 @@ def tune_ranker_and_n_cand(
 
 
 # ---------------------------------------------------------------------------
+# B5 — Joint ranker + n_cand allocation tuning, v2 (anti-overfit)
+# ---------------------------------------------------------------------------
+
+def tune_ranker_and_n_cand_v2(
+    labeled_df: pl.DataFrame,
+    eval_features_df: pl.DataFrame,
+    gt_val: pl.DataFrame,
+    cg_names: list[str],
+    *,
+    gt_test: pl.DataFrame | None = None,
+    combined_objective: bool = True,
+    n_max_per_cg: int = 500,
+    n_trials: int = 60,
+    ranker_space: Callable[[optuna.Trial], dict] | None = None,
+    k: int = 100,
+    n_cand_step: int = 25,
+    n_cand_min: int = 0,
+    early_stopping_rounds: int = 150,
+    task_type: str = "GPU",
+    devices: str | None = "0",
+    study_name: str | None = None,
+    storage: str | None = None,
+    sampler: optuna.samplers.BaseSampler | None = None,
+    n_startup_trials: int = 20,
+    seed: int = 42,
+    show_progress_bar: bool = False,
+    baseline_params: dict | None = None,
+) -> optuna.Study:
+    """Anti-overfit variant of :func:`tune_ranker_and_n_cand`.
+
+    Three changes from the v1 above:
+
+    1. **No total-budget penalty.** Trials whose summed n_cand would have
+       exceeded a soft cap are no longer forced to return 0 — TPE got too
+       much zero-noise from this in the original 142-trial joint study.
+       The downstream :class:`RankerModel.fit` already caps to 1023 rows
+       per user on GPU via per-row RRF score, so an arbitrarily large
+       merged pool is safe. Optuna learns the true Recall(n_cand) surface.
+
+    2. **n_cand_min defaults to 0.** A CG can be effectively disabled when
+       its contribution is dominated by other CGs — useful for newly
+       added CGs whose value is uncertain (e.g. a freshly retrained
+       eSASRec). The v1 floor of 25 forced every CG into every trial.
+
+    3. **Combined val + test objective** (``combined_objective=True``,
+       ``gt_test`` provided): metric is ``0.5 * (recall_val + recall_test)``.
+       The temporal_split test window is +1 day from val; averaging the
+       two recalls reduces variance ~√2 and shrinks the val→public gap
+       observed in the original joint Optuna run (val +13.6 vs public +5.4).
+
+    Args:
+        labeled_df / eval_features_df: cached ``train_ranker.py`` outputs
+            with ``{name}_rank`` columns at ``n_cand=n_max_per_cg``.
+        gt_val: validation ground truth (always required).
+        gt_test: test ground truth (required when ``combined_objective``).
+        cg_names: CGs whose ``n_cand_*`` to optimise. Each must have
+            ``{name}_rank`` in both DataFrames.
+        n_max_per_cg: must equal the n_cand used to generate the cached
+            features; sets the upper bound on ``n_cand_*`` (default 500).
+        n_cand_min: lower bound on each ``n_cand_*`` (default 0).
+        n_startup_trials: random exploration before TPE kicks in
+            (default 20 — wider than v1 to weaken multi-test bias).
+        early_stopping_rounds, task_type, devices: passed to RankerModel.
+
+    Returns:
+        Fitted ``optuna.Study``. Direction is "maximize".
+    """
+    ranker_space = ranker_space or default_ranker_space
+
+    if combined_objective and gt_test is None:
+        raise ValueError(
+            "tune_ranker_and_n_cand_v2: combined_objective=True requires "
+            "gt_test; pass gt_test or set combined_objective=False"
+        )
+
+    rank_cols = [f"{name}_rank" for name in cg_names]
+    missing_labeled = [c for c in rank_cols if c not in labeled_df.columns]
+    missing_eval = [c for c in rank_cols if c not in eval_features_df.columns]
+    if missing_labeled:
+        raise ValueError(
+            f"tune_ranker_and_n_cand_v2: labeled_df missing {missing_labeled}; "
+            f"got {list(labeled_df.columns)}"
+        )
+    if missing_eval:
+        raise ValueError(
+            f"tune_ranker_and_n_cand_v2: eval_features_df missing {missing_eval}; "
+            f"got {list(eval_features_df.columns)}"
+        )
+
+    def objective(trial: optuna.Trial) -> float:
+        ranker_params = ranker_space(trial)
+        n_cands = {
+            name: trial.suggest_int(
+                f"n_cand_{name}", n_cand_min, n_max_per_cg, step=n_cand_step,
+            )
+            for name in cg_names
+        }
+
+        # No budget penalty — RankerModel caps to 1023 rows/user on GPU.
+        keep_expr = pl.lit(False)
+        any_active = False
+        for name, c in n_cands.items():
+            if c <= 0:
+                continue
+            any_active = True
+            rc = f"{name}_rank"
+            keep_expr = keep_expr | (
+                pl.col(rc).is_not_null() & (pl.col(rc) <= c)
+            )
+        if not any_active:
+            return 0.0
+
+        labeled_f = labeled_df.filter(keep_expr)
+        eval_f = eval_features_df.filter(keep_expr)
+        if len(labeled_f) == 0 or len(eval_f) == 0:
+            return 0.0
+
+        df_tr, df_va = _split_for_ranker(labeled_f, seed=seed)
+        ranker = RankerModel(
+            **ranker_params,
+            random_state=seed,
+            early_stopping_rounds=early_stopping_rounds,
+            task_type=task_type,
+            devices=devices,
+        )
+        ranker.fit(df_tr, df_va)
+
+        # ``score`` once, then top_k_per_user — letting us compute
+        # recall on val *and* test from the same predictions.
+        scored = ranker.score(eval_f)
+        top_k = (
+            RankerModel.top_k_per_user(scored, k=k, score_col="ranker_score")
+            .rename({"ranker_score": "score"})
+        )
+
+        recall_val = recall_at_k(gt_val, top_k, k=k)
+        if combined_objective:
+            recall_test = recall_at_k(gt_test, top_k, k=k)
+            trial.set_user_attr("recall_val", recall_val)
+            trial.set_user_attr("recall_test", recall_test)
+            return 0.5 * (recall_val + recall_test)
+        return recall_val
+
+    if sampler is None:
+        sampler = optuna.samplers.TPESampler(
+            seed=seed, multivariate=True, n_startup_trials=n_startup_trials,
+        )
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=storage is not None,
+        sampler=sampler,
+        direction="maximize",
+    )
+    _maybe_enqueue_baseline(study, baseline_params)
+    log.info(
+        "tune_ranker_and_n_cand_v2: %d trials, %d CGs, n_max=%d, n_min=%d, "
+        "combined=%s, task_type=%s, storage=%s",
+        n_trials, len(cg_names), n_max_per_cg, n_cand_min, combined_objective,
+        task_type, storage,
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
+    return study
+
+
+# ---------------------------------------------------------------------------
 # Default search spaces (per docs/roadmap.md §D.2)
 # ---------------------------------------------------------------------------
 
