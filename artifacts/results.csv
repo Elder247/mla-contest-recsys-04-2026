@@ -39,3 +39,5 @@ run_id,model,dataset_size,split,score,config_path
 20260505_203813,esasrec,500m,test,129.5919,configs/model/esasrec.yaml
 20260505_211901,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,esasrec,audio_knn]",500m,val,391.7467,configs/ranker.yaml
 20260505_211901,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,esasrec,audio_knn]",500m,test,386.233,configs/ranker.yaml
+20260505_225820,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,esasrec,audio_knn]",500m,val,358.0376,configs/ranker.yaml
+20260505_225820,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,esasrec,audio_knn]",500m,test,352.7196,configs/ranker.yaml
