@@ -60,7 +60,7 @@ def main(cfg: DictConfig) -> None:
         )
     log.info("loaded full %s for '%s': %d rows", data_source, name, len(train_df))
 
-    target_path = cg_cache_path(name, cfg.data.size, "_full", "artifacts/cg")
+    target_path = cg_cache_path(name, cfg.data.size, "_full", "/home/astrofimuk/dc-remote/artifacts/cg")
     log.info("fitting CG '%s' → %s", name, target_path)
 
     fit_or_load_cg(
@@ -69,7 +69,7 @@ def main(cfg: DictConfig) -> None:
         size=cfg.data.size,
         suffix="_full",
         force_refit=bool(cfg.get("force_refit", False)),
-        cache_dir="artifacts/cg",
+        cache_dir="/home/astrofimuk/dc-remote/artifacts/cg",
     )
     log.info("done — %s ready", target_path)
 

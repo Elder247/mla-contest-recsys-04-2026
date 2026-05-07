@@ -18,10 +18,10 @@ phase: ranker
 # Set to null so per-CG / per-phase defaults below kick in. Override on CLI
 # (eg. ``n_trials=3``) to force-run an exact count for smoke tests / debug.
 n_trials: null
-artifacts_root: artifacts                 # override to redirect study + cache reads
-storage_dir: ${artifacts_root}/optuna     # sqlite storage will go here
-top_k: 100                                # contest k
-run_id: "008"                             # used to locate cached features / ranker pkl
+artifacts_root: /home/astrofimuk/dc-remote/artifacts  # override to redirect study + cache reads
+storage_dir: ${artifacts_root}/optuna                 # sqlite storage will go here
+top_k: 100                                            # contest k
+run_id: "008"                                         # used to locate cached features / ranker pkl
 
 # Default study_name = ${phase} for ranker / n_cand and ``cg_${cg_name}`` for cg.
 # Override on CLI for parallel studies (eg. ``study_name=cg_als_v2``).

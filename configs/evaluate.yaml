@@ -9,7 +9,7 @@ top_k: 100
 splits:
   - val
   - test
-output_dir: artifacts
+output_dir: /home/astrofimuk/dc-remote/artifacts/cg
 
 hydra:
   output_subdir: null

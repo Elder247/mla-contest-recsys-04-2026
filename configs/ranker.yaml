@@ -15,7 +15,7 @@ filter_dislikes: true
 cache_features: false
 compute_feature_importance: true
 enable_embed_features: true
-artifacts_root: artifacts
+artifacts_root: /home/astrofimuk/dc-remote/artifacts
 output_dir: ${artifacts_root}
 ranker_dir: ${artifacts_root}
 features_dir: ${artifacts_root}/features
@@ -34,7 +34,7 @@ label_gt_path: null
 candidate_generators:
 - _target_: src.models.pop.DecayPop
   name: decaypop
-  n_cand: 175
+  n_cand: 500
   half_life_units: 106299
 - _target_: src.models.als.ALSModel
   name: als
@@ -42,7 +42,7 @@ candidate_generators:
   iterations: 23
   regularization: 0.0001580457889424532
   alpha: 0.5097730246429841
-  n_cand: 175
+  n_cand: 500
   high_engagement_weight: 3.919856645475176
   mid_engagement_weight: 1.0
   low_engagement_weight: 0.3909190180723426
@@ -51,39 +51,61 @@ candidate_generators:
   random_state: 42
 - _target_: src.models.repeat.RepeatListenModel
   name: repeat
-  n_cand: 300
+  n_cand: 500
   half_life_units: 877488
 - _target_: src.models.itemknn.ItemKNNModel
   name: itemknn
   k: 100
-  n_cand: 100
+  n_cand: 500
 - _target_: src.models.artist_pop.ArtistAlbumPopModel
   name: artist_pop
   entity: artist
   top_entities: 28
-  n_cand: 50
+  n_cand: 500
   half_life_units: 783837
   data_root: ${data.root}
 - _target_: src.models.artist_pop.ArtistAlbumPopModel
   name: album_pop
   entity: album
   top_entities: 28
-  n_cand: 150
+  n_cand: 500
   half_life_units: 566679
   data_root: ${data.root}
 - _target_: src.models.recent_likes.RecentLikesModel
   name: recent_likes
-  n_cand: 50
+  n_cand: 500
   half_life_units: 230003
   data_source: likes
 - _target_: src.models.audio_knn.AudioEmbedKNNModel
   name: audio_knn
-  n_cand: 200
+  n_cand: 500
   user_history_k: 15
   hnsw_m: 57
   ef_construction: 209
   ef_search: 118
   data_root: ${data.root}
+- _target_: src.models.esasrec.ESASRecModel
+  name: esasrec
+  n_cand: 500
+  emb_dim: 128
+  n_blocks: 2
+  n_heads: 4
+  dropout: 0.3
+  sequence_max_len: 200
+  n_negatives: 16
+  max_epochs: 20
+  lr: 0.001
+  batch_size: 512
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  patience: 5
+  val_pct: 0.1
+  num_workers: 4
+  use_amp: true
+  window_stride: 50
+  infer_batch_size: 64
+  device: auto
+  random_state: 42
 ranker:
   iterations: 3500
   depth: 8

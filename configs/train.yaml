@@ -5,7 +5,7 @@ defaults:
   - _self_
 
 seed: 42
-output_dir: artifacts
+output_dir: /home/astrofimuk/dc-remote/artifacts
 
 hydra:
   output_subdir: null
