@@ -22,6 +22,7 @@ from pathlib import Path
 
 import hydra
 import polars as pl
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from src.inference.phases import load_eval_users_from_csv
@@ -30,8 +31,12 @@ from src.utils import setup_logging
 log = logging.getLogger(__name__)
 
 
-def _run_phase(script: str, overrides: list[str]) -> None:
-    cmd = [sys.executable, "-u", script] + overrides
+def _run_phase(script: str, overrides: list[str], config_name: str | None = None) -> None:
+    """Same semantics as train_ranker._run_phase — propagates --config-name."""
+    cmd = [sys.executable, "-u", script]
+    if config_name is not None and config_name not in ("ranker", "submit_ranker"):
+        cmd.append(f"--config-name={config_name}")
+    cmd.extend(overrides)
     log.info("running phase: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -62,6 +67,9 @@ def main(cfg: DictConfig) -> None:
     setup_logging()
     log.info("config:\n%s", OmegaConf.to_yaml(cfg))
 
+    config_name = HydraConfig.get().job.config_name
+    log.info("config_name=%s (passed to subprocess phases)", config_name)
+
     run_id = str(cfg.run_id)
     eval_users = load_eval_users_from_csv(cfg.data.users_csv)
     log.info("eval users: %d", len(eval_users))
@@ -82,7 +90,7 @@ def main(cfg: DictConfig) -> None:
         _hydra_override("suffix", "_full"),
         _hydra_override("train_cutoff_ts", None),  # full data
     ]
-    _run_phase("scripts/_phases/fit_cgs.py", fit_overrides)
+    _run_phase("scripts/_phases/fit_cgs.py", fit_overrides, config_name=config_name)
 
     # ── 2. Phase 2 — generate candidates for all eval users ──────────────────
     cand_root = Path(cfg.candidates_dir) / f"{run_id}_full"
@@ -102,7 +110,7 @@ def main(cfg: DictConfig) -> None:
         _hydra_override("users_source", str(eval_users_csv)),
         _hydra_override("output_dir_phase", str(full_dir)),
     ]
-    _run_phase("scripts/_phases/gen_candidates.py", gen_overrides)
+    _run_phase("scripts/_phases/gen_candidates.py", gen_overrides, config_name=config_name)
     merged_path = full_dir / "merged.parquet"
 
     # ── 3. Phase 3 — compute features ────────────────────────────────────────
@@ -130,7 +138,7 @@ def main(cfg: DictConfig) -> None:
         _hydra_override("cutoff_ts", cutoff_ts),
         _hydra_override("label_gt_path", None),  # submission has no labels
     ]
-    _run_phase("scripts/_phases/compute_features.py", feat_overrides)
+    _run_phase("scripts/_phases/compute_features.py", feat_overrides, config_name=config_name)
 
     # ── 4. In-process: predict + write submission CSV ────────────────────────
     log.info("loading ranker ← %s", ranker_path)

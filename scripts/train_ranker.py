@@ -38,6 +38,7 @@ from pathlib import Path
 import hydra
 import numpy as np
 import polars as pl
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from sklearn.model_selection import GroupShuffleSplit
 
@@ -58,14 +59,23 @@ log = logging.getLogger(__name__)
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
-def _run_phase(script: str, overrides: list[str]) -> None:
-    """Run a phase script as ``python -u <script> <overrides>``.
+def _run_phase(script: str, overrides: list[str], config_name: str | None = None) -> None:
+    """Run a phase script as ``python -u <script> [--config-name=<name>] <overrides>``.
 
-    Bubbles up the subprocess's exit code on failure. Stdout/stderr stream
-    to the parent's TTY so ``tee /tmp/run.log`` continues to capture
-    everything in order.
+    ``config_name`` propagates the parent's ``--config-name=...`` to the
+    subprocess so it loads the same ranker yaml (e.g. ``ranker_v2_top1``)
+    instead of falling back to the default ``ranker``. Critical for
+    pipelines that rely on per-CG fields like ``n_cand_keep`` set in the
+    overlay yaml — without it, the subprocess sees the base config's
+    candidate_generators and the post-merge filter is silently a no-op.
+
+    Stdout/stderr stream to the parent's TTY so ``tee /tmp/run.log``
+    continues to capture everything in order.
     """
-    cmd = [sys.executable, "-u", script] + overrides
+    cmd = [sys.executable, "-u", script]
+    if config_name is not None and config_name != "ranker":
+        cmd.append(f"--config-name={config_name}")
+    cmd.extend(overrides)
     log.info("running phase: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -110,6 +120,10 @@ def main(cfg: DictConfig) -> None:
     log.info("config:\n%s", OmegaConf.to_yaml(cfg))
     np.random.seed(cfg.seed)
 
+    # Propagate to subprocesses so they load the same overlay (e.g. ranker_v2_top1).
+    config_name = HydraConfig.get().job.config_name
+    log.info("config_name=%s (passed to subprocess phases)", config_name)
+
     run_id = str(cfg.run_id)
     eval_users = load_eval_users_from_csv(cfg.data.users_csv)
 
@@ -152,7 +166,7 @@ def main(cfg: DictConfig) -> None:
         _hydra_override("suffix", ""),
         _hydra_override("train_cutoff_ts", train_cutoff_ts),
     ]
-    _run_phase("scripts/_phases/fit_cgs.py", fit_overrides)
+    _run_phase("scripts/_phases/fit_cgs.py", fit_overrides, config_name=config_name)
 
     # ── 3. Phase 2 — generate candidates × 2 (val users + full eval) ─────────
     cand_root = Path(cfg.candidates_dir) / run_id
@@ -180,11 +194,11 @@ def main(cfg: DictConfig) -> None:
     _run_phase("scripts/_phases/gen_candidates.py", common_gen + [
         _hydra_override("users_source", str(val_users_csv)),
         _hydra_override("output_dir_phase", str(val_dir)),
-    ])
+    ], config_name=config_name)
     _run_phase("scripts/_phases/gen_candidates.py", common_gen + [
         _hydra_override("users_source", str(eval_users_csv)),
         _hydra_override("output_dir_phase", str(eval_dir)),
-    ])
+    ], config_name=config_name)
 
     merged_train_path = val_dir / "merged.parquet"
     merged_eval_path = eval_dir / "merged.parquet"
@@ -218,12 +232,12 @@ def main(cfg: DictConfig) -> None:
         _hydra_override("merged_path", str(merged_train_path)),
         _hydra_override("output_path", str(feats_train_path)),
         _hydra_override("label_gt_path", str(gt_val_path)),
-    ])
+    ], config_name=config_name)
     _run_phase("scripts/_phases/compute_features.py", common_feat + [
         _hydra_override("merged_path", str(merged_eval_path)),
         _hydra_override("output_path", str(feats_eval_path)),
         # No label_gt_path — eval features are unlabeled; predict only.
-    ])
+    ], config_name=config_name)
 
     # ── 5. In-process: load labeled train features → train ranker ────────────
     log.info("loading labeled train features ← %s", feats_train_path)
