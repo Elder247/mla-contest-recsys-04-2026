@@ -27,6 +27,7 @@ import logging
 
 import numpy as np
 import polars as pl
+from scipy.sparse import csr_matrix
 
 log = logging.getLogger(__name__)
 
@@ -774,11 +775,17 @@ def _user_mean_embeddings(
     uid_v = uid_np[valid]
     rows_v = rows[valid]
     unique_uids, inv = np.unique(uid_v, return_inverse=True)
-    sums = np.zeros((len(unique_uids), dim), dtype=np.float32)
-    counts = np.zeros(len(unique_uids), dtype=np.int32)
-    np.add.at(sums, inv, emb_arr[rows_v])
-    np.add.at(counts, inv, 1)
-    means = sums / counts[:, None].astype(np.float32)
+    n_users = len(unique_uids)
+    n_emb = emb_arr.shape[0]
+    # Sparse-scatter via CSR @ dense: avoids the (len(rows_v), dim) fancy-index
+    # temporary that np.add.at materialises (~50 GB on 500m) and is 5–20× faster
+    # via BLAS SpMM. csr_matrix sums duplicate (row, col) pairs by construction —
+    # same semantics as np.add.at.
+    ones = np.ones(len(rows_v), dtype=np.float32)
+    S = csr_matrix((ones, (inv, rows_v)), shape=(n_users, n_emb))
+    sums = np.asarray(S @ emb_arr, dtype=np.float32)
+    counts = np.asarray(S.sum(axis=1)).reshape(-1).astype(np.float32)
+    means = sums / counts[:, None]
     norms = np.linalg.norm(means, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     means = (means / norms).astype(np.float32)
