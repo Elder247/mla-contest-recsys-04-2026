@@ -7,9 +7,26 @@ merge_candidates() outer-joins all of them on (uid, item_id) and renames
 ``score`` to ``{name}_score`` so each CG's contribution is preserved as a
 distinct feature column. Missing entries become NULL — CatBoost can handle
 that natively via ``nan_mode="Min"``.
+
+apply_n_cand_keep() is an OPTIONAL post-merge row filter that emulates the
+``n_cand_keep`` semantics learnt by the joint_v2 Optuna study:
+
+  - Each CG generates a *pool* of candidates (``n_cand`` in the yaml).
+  - After the outer-join, rows are kept iff at least one CG's rank is ≤
+    that CG's ``n_cand_keep`` value (which is ≤ ``n_cand``).
+  - CGs with ``n_cand_keep == 0`` contribute no unique rows but their
+    ``{name}_rank``/``{name}_score`` columns still enrich rows that other
+    CGs put through. This matches the keep_expr used by Optuna trials and
+    lets the production ranker see the same dense feature distribution.
+
+The filter is a no-op when no CG block has the ``n_cand_keep`` field, so
+existing pipelines (and configs without the field) keep working unchanged.
 """
+from __future__ import annotations
+
 import logging
 from functools import reduce
+from typing import Any, Iterable
 
 import polars as pl
 
@@ -81,6 +98,86 @@ def merge_candidates(
         len(merged), len(cg_dataframes),
     )
     return merged
+
+
+def apply_n_cand_keep(
+    merged: pl.DataFrame,
+    cg_cfg_list: Iterable[Any],
+) -> pl.DataFrame:
+    """Drop rows where no CG has rank ≤ its ``n_cand_keep``.
+
+    Acts as a post-merge replacement for "what if each CG had been called
+    with ``n_cand=n_cand_keep`` instead of ``n_cand=n_cand``". The pool is
+    still big (so per-CG rank/score columns are densely populated and the
+    ranker sees rich features), but rows that wouldn't have made it into
+    any CG's top-``n_cand_keep`` are dropped — matching joint_v2 Optuna's
+    keep_expr semantics.
+
+    Args:
+        merged: outer-joined candidate DataFrame from :func:`merge_candidates`.
+            Must contain ``{name}_rank`` for every CG in ``cg_cfg_list``.
+        cg_cfg_list: iterable of CG config blocks (Hydra DictConfig or plain
+            dict). Each block may have an optional ``n_cand_keep`` integer:
+              - field absent on every block → no-op (returns ``merged``).
+              - ``n_cand_keep > 0`` → row survives if ``{name}_rank`` ≤ value.
+              - ``n_cand_keep == 0`` → CG contributes no unique rows (its
+                rank/score columns still enrich rows kept by other CGs).
+              - field absent on some blocks but set on others → the absent
+                blocks contribute no row-keep predicate either (treated as
+                "this CG doesn't gate the pool"). To opt back in, set
+                ``n_cand_keep`` equal to ``n_cand``.
+
+    Returns:
+        Filtered DataFrame with the same columns as ``merged``. When the
+        field is set on every CG and at least one row survives every CG's
+        check, output is a strict subset of ``merged`` rows.
+    """
+    has_field = False
+    keep_terms = []
+    for cg_cfg in cg_cfg_list:
+        if "n_cand_keep" not in cg_cfg:
+            continue
+        has_field = True
+        n_keep = cg_cfg["n_cand_keep"]
+        if n_keep is None or n_keep <= 0:
+            # CG with n_cand_keep=0 contributes no unique rows — its rank
+            # column still survives in the dataframe to enrich features
+            # on rows kept by other CGs (which is the whole point).
+            continue
+        name = cg_cfg.get("name")
+        rank_col = f"{name}_rank"
+        if rank_col not in merged.columns:
+            raise ValueError(
+                f"apply_n_cand_keep: CG '{name}' has n_cand_keep={n_keep} "
+                f"but '{rank_col}' is not in merged columns "
+                f"({list(merged.columns)})"
+            )
+        keep_terms.append(
+            pl.col(rank_col).is_not_null() & (pl.col(rank_col) <= int(n_keep))
+        )
+
+    if not has_field:
+        log.info(
+            "apply_n_cand_keep: no CG has the field — returning merged unchanged"
+        )
+        return merged
+
+    if not keep_terms:
+        # At least one CG had the field, but every value was 0 / None.
+        # That asks for an empty pool, which is never useful.
+        raise ValueError(
+            "apply_n_cand_keep: every CG with 'n_cand_keep' set was 0 — "
+            "no rows would survive. Set n_cand_keep > 0 for at least one CG."
+        )
+
+    keep_expr = reduce(lambda a, b: a | b, keep_terms)
+    before = len(merged)
+    filtered = merged.filter(keep_expr)
+    log.info(
+        "apply_n_cand_keep: filtered %d → %d rows (dropped %d) using %d active CGs",
+        before, len(filtered), before - len(filtered), len(keep_terms),
+    )
+    return filtered
 
 
 def cg_recall(

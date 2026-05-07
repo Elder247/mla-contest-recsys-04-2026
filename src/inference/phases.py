@@ -45,7 +45,7 @@ from src.data.dataset import (
     positive_listens,
 )
 from src.data.features import add_features
-from src.inference.merge_candidates import merge_candidates
+from src.inference.merge_candidates import apply_n_cand_keep, merge_candidates
 from src.inference.pipeline import apply_exclude_filter, load_eval_users
 from src.training.cg_cache import cg_cache_path, fit_or_load_cg
 
@@ -196,6 +196,11 @@ def generate_phase(
     cg_dfs = {name: pl.read_parquet(str(p)) for name, p in cg_paths}
     merged = merge_candidates(cg_dfs)
     del cg_dfs
+    gc.collect()
+
+    # Optional post-merge row filter — see apply_n_cand_keep docstring.
+    # No-op when no CG block has the ``n_cand_keep`` field set.
+    merged = apply_n_cand_keep(merged, cg_cfg_list)
     gc.collect()
 
     if filter_dislikes:
