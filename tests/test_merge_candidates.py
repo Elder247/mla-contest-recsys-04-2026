@@ -118,49 +118,39 @@ def test_apply_n_cand_keep_partial_field_treats_unset_as_no_gate(merged_two_cgs)
 # ── compute_cg_aggregates ────────────────────────────────────────────────
 
 
-def test_compute_cg_aggregates_adds_six_columns(merged_two_cgs):
-    """Output schema must contain all six aggregate columns."""
+def test_compute_cg_aggregates_adds_two_columns(merged_two_cgs):
+    """Output schema must contain ``cg_count`` and ``cg_mean_score_norm``.
+
+    The rank-derived aggregates (``cg_min/max/mean_rank``, ``cg_rrf_score``)
+    were intentionally removed — they leak the ranker's GPU train-pool
+    selection criterion (``head(1023)`` keyed on RRF over ``*_rank`` cols).
+    See ``compute_cg_aggregates`` docstring.
+    """
     cg_cfg_list = [{"name": "cg_a"}, {"name": "cg_b"}]
     out = compute_cg_aggregates(merged_two_cgs, cg_cfg_list)
-    expected = {
-        "cg_count", "cg_min_rank", "cg_max_rank", "cg_mean_rank",
-        "cg_rrf_score", "cg_mean_score_norm",
-    }
-    assert expected.issubset(set(out.columns))
+    assert {"cg_count", "cg_mean_score_norm"}.issubset(set(out.columns))
     assert out["cg_count"].dtype == pl.Int32
-    for c in ("cg_min_rank", "cg_max_rank", "cg_mean_rank",
-              "cg_rrf_score", "cg_mean_score_norm"):
-        assert out[c].dtype == pl.Float32, f"{c} must be Float32, got {out[c].dtype}"
+    assert out["cg_mean_score_norm"].dtype == pl.Float32
+    # Removed leaky columns must NOT be present.
+    leaky = {"cg_min_rank", "cg_max_rank", "cg_mean_rank", "cg_rrf_score"}
+    assert leaky.isdisjoint(set(out.columns)), (
+        f"Leaky aggregate columns must not be added: {leaky & set(out.columns)}"
+    )
 
 
-def test_compute_cg_aggregates_correct_values_on_overlap(merged_two_cgs):
-    """Hand-computed values for items 1 (cg_a only) and 4 (both CGs)."""
+def test_compute_cg_aggregates_count_correct_on_overlap(merged_two_cgs):
+    """Hand-computed cg_count for items 1 (cg_a only), 4 (both), 8 (cg_b only)."""
     cg_cfg_list = [{"name": "cg_a"}, {"name": "cg_b"}]
     out = compute_cg_aggregates(merged_two_cgs, cg_cfg_list).sort("item_id")
 
-    # item_id=1 → only in cg_a (rank=1).
     row1 = out.filter(pl.col("item_id") == 1).row(0, named=True)
     assert row1["cg_count"] == 1
-    assert row1["cg_min_rank"] == pytest.approx(1.0)
-    assert row1["cg_max_rank"] == pytest.approx(1.0)
-    assert row1["cg_mean_rank"] == pytest.approx(1.0)
-    assert row1["cg_rrf_score"] == pytest.approx(1.0 / 61.0, rel=1e-5)
 
-    # item_id=4 → cg_a (rank=4) AND cg_b (rank=1). Both contribute.
     row4 = out.filter(pl.col("item_id") == 4).row(0, named=True)
     assert row4["cg_count"] == 2
-    assert row4["cg_min_rank"] == pytest.approx(1.0)
-    assert row4["cg_max_rank"] == pytest.approx(4.0)
-    assert row4["cg_mean_rank"] == pytest.approx(2.5)
-    assert row4["cg_rrf_score"] == pytest.approx(1.0 / 64.0 + 1.0 / 61.0, rel=1e-5)
 
-    # item_id=8 → only in cg_b (rank=5).
     row8 = out.filter(pl.col("item_id") == 8).row(0, named=True)
     assert row8["cg_count"] == 1
-    assert row8["cg_min_rank"] == pytest.approx(5.0)
-    assert row8["cg_max_rank"] == pytest.approx(5.0)
-    assert row8["cg_mean_rank"] == pytest.approx(5.0)
-    assert row8["cg_rrf_score"] == pytest.approx(1.0 / 65.0, rel=1e-5)
 
 
 def test_compute_cg_aggregates_score_norm_per_cg_minmax(merged_two_cgs):
@@ -241,18 +231,16 @@ def test_compute_cg_aggregates_constant_score_column_skipped():
     assert rows[20]["cg_mean_score_norm"] == pytest.approx(0.0, abs=1e-5)
 
 
-def test_compute_cg_aggregates_rrf_uses_only_present_ranks():
-    """RRF must skip null ranks (CG didn't return that item) — the
-    ``fill_null(0.0)`` after the 1/(k+rank) inverse is what implements
-    that, so a CG that didn't contribute adds 0 to the sum."""
+def test_compute_cg_aggregates_count_uses_only_present_ranks():
+    """``cg_count`` reflects how many CGs returned the item.
+
+    Singleton items (only one CG saw them) → cg_count == 1.
+    """
     cg_a = _cg_df("cg_a", [(1, 10, 0.9, 5)])  # only cg_a sees item 10
     cg_b = _cg_df("cg_b", [(1, 99, 0.1, 5)])  # only cg_b sees item 99
     merged = merge_candidates({"cg_a": cg_a, "cg_b": cg_b})
     out = compute_cg_aggregates(merged, [{"name": "cg_a"}, {"name": "cg_b"}])
-    # item 10 → only cg_a contributes; rrf = 1/(60+5) + 0
     rows = {r["item_id"]: r for r in out.iter_rows(named=True)}
-    assert rows[10]["cg_rrf_score"] == pytest.approx(1.0 / 65.0, rel=1e-5)
-    assert rows[99]["cg_rrf_score"] == pytest.approx(1.0 / 65.0, rel=1e-5)
     assert rows[10]["cg_count"] == 1
     assert rows[99]["cg_count"] == 1
 

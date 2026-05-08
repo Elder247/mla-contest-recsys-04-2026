@@ -63,8 +63,21 @@ class RankerModel:
         # GPU YetiRank hard limit: max 1023 candidates per query group.
         # Cap to 1023 keeping all positives (sort label desc before head).
         # Sort negatives by Reciprocal Rank Fusion score (RRF).
+        #
+        # CRITICAL: only per-CG raw rank columns (``{cg_name}_rank``) are
+        # used in the RRF trim criterion. Any column whose name starts with
+        # ``cg_`` is treated as a *derived* aggregate — including any future
+        # ``cg_min_rank`` / ``cg_max_rank`` / ``cg_mean_rank`` resurrected
+        # by mistake — and excluded. Reason: feeding the model a feature
+        # equal (or monotonic) to the trim criterion is a textbook
+        # sample-selection leak, which we already paid for once (v3
+        # features → Recall@100 ≈ 10). See ``compute_cg_aggregates``
+        # docstring for the full post-mortem.
         if self.task_type.upper() == "GPU":
-            rank_cols = [c for c in df_train.columns if c.endswith("_rank")]
+            rank_cols = [
+                c for c in df_train.columns
+                if c.endswith("_rank") and not c.startswith("cg_")
+            ]
             K_RRF = 60
             rrf_expr = pl.sum_horizontal(*[
                 (1.0 / (K_RRF + pl.col(c))).fill_null(0.0)

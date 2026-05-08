@@ -180,25 +180,37 @@ def apply_n_cand_keep(
     return filtered
 
 
-_RRF_K = 60.0
-
-
 def compute_cg_aggregates(
     merged: pl.DataFrame,
     cg_cfg_list: Iterable[Any],
 ) -> pl.DataFrame:
     """Append per-row aggregate features over the CG ``{name}_rank`` /
-    ``{name}_score`` columns. Adds 6 Float32 columns:
+    ``{name}_score`` columns. Adds 2 Float32/Int32 columns:
 
       - ``cg_count``           — number of CGs that contributed this row
-      - ``cg_min_rank``        — best (smallest) rank across CGs
-      - ``cg_max_rank``        — worst rank across CGs
-      - ``cg_mean_rank``       — mean of non-null ranks
-      - ``cg_rrf_score``       — sum of ``1/(60+rank_i)`` over non-null ranks
       - ``cg_mean_score_norm`` — mean of MinMax-normalized scores (per-CG
                                  normalization on the visible pool; only
                                  the aggregate is normalized — original
                                  ``{name}_score`` columns are untouched)
+
+    NOTE on removed rank-derived aggregates (``cg_min_rank``,
+    ``cg_max_rank``, ``cg_mean_rank``, ``cg_rrf_score``): they used to be
+    here but were a textbook **sample-selection leak**. ``RankerModel.fit``
+    on GPU caps train+val pools to 1023 rows/uid keyed by
+    ``sum(1/(60+rank_i))`` over every ``*_rank`` column — which is
+    ``cg_rrf_score`` verbatim, and ``cg_min_rank`` correlates with it
+    monotonically. Adding those as explicit features handed CatBoost the
+    exact selection criterion in one column → it learned the inverse of
+    the true label distribution (low ``cg_rrf_score`` items survive in
+    train *only* if labelled positive, so the model predicted "low
+    ``cg_rrf_score`` → positive"; at inference the eval pool has the
+    full long tail of low-RRF items, all of which the model then
+    incorrectly ranks high → top-100 pollution → recall ≈ random).
+    Empirically: feature_importance v3_features (with rank aggregates):
+    cg_rrf_score=21.9, cg_min_rank=14.0, cg_mean_rank=10.7,
+    cg_max_rank=2.8, with val/test Recall@100 ≈ 10 (vs 319 baseline
+    without these features). ``cg_count`` and ``cg_mean_score_norm`` do
+    not mirror the trim formula and are kept.
 
     Polars' ``*_horizontal`` reductions skip nulls natively; the count is
     derived from the same masks for consistency. Aggregates are intentionally
@@ -217,28 +229,9 @@ def compute_cg_aggregates(
         len(rank_cols), len(score_cols), len(merged),
     )
 
-    # All horizontal reductions in Float64 — Polars panics ("cannot get ref
-    # Float32 from Float64") if we cast intermediate ``min/max/mean_horizontal``
-    # outputs to Float32 because the engine's planned dtype for the reduction
-    # disagrees with the cast. Cast only the materialised output Series.
-    rank_cols_f64 = [pl.col(c).cast(pl.Float64) for c in rank_cols]
     not_null_terms = [pl.col(c).is_not_null().cast(pl.Int32) for c in rank_cols]
-    rrf_terms = [
-        (1.0 / (_RRF_K + pl.col(c).cast(pl.Float64))).fill_null(0.0)
-        for c in rank_cols
-    ]
-
     out = merged.with_columns([
         pl.sum_horizontal(*not_null_terms).cast(pl.Int32).alias("cg_count"),
-        pl.min_horizontal(*rank_cols_f64).alias("cg_min_rank"),
-        pl.max_horizontal(*rank_cols_f64).alias("cg_max_rank"),
-        pl.mean_horizontal(*rank_cols_f64).alias("cg_mean_rank"),
-        pl.sum_horizontal(*rrf_terms).alias("cg_rrf_score"),
-    ]).with_columns([
-        pl.col("cg_min_rank").cast(pl.Float32),
-        pl.col("cg_max_rank").cast(pl.Float32),
-        pl.col("cg_mean_rank").cast(pl.Float32),
-        pl.col("cg_rrf_score").cast(pl.Float32),
     ])
 
     # ── MinMax-normalised score aggregate ────────────────────────────────────
