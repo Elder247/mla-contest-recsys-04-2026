@@ -115,6 +115,148 @@ def test_apply_n_cand_keep_partial_field_treats_unset_as_no_gate(merged_two_cgs)
     assert sorted(out["item_id"].to_list()) == [1, 2]
 
 
+# ── compute_cg_aggregates ────────────────────────────────────────────────
+
+
+def test_compute_cg_aggregates_adds_six_columns(merged_two_cgs):
+    """Output schema must contain all six aggregate columns."""
+    cg_cfg_list = [{"name": "cg_a"}, {"name": "cg_b"}]
+    out = compute_cg_aggregates(merged_two_cgs, cg_cfg_list)
+    expected = {
+        "cg_count", "cg_min_rank", "cg_max_rank", "cg_mean_rank",
+        "cg_rrf_score", "cg_mean_score_norm",
+    }
+    assert expected.issubset(set(out.columns))
+    assert out["cg_count"].dtype == pl.Int32
+    for c in ("cg_min_rank", "cg_max_rank", "cg_mean_rank",
+              "cg_rrf_score", "cg_mean_score_norm"):
+        assert out[c].dtype == pl.Float32, f"{c} must be Float32, got {out[c].dtype}"
+
+
+def test_compute_cg_aggregates_correct_values_on_overlap(merged_two_cgs):
+    """Hand-computed values for items 1 (cg_a only) and 4 (both CGs)."""
+    cg_cfg_list = [{"name": "cg_a"}, {"name": "cg_b"}]
+    out = compute_cg_aggregates(merged_two_cgs, cg_cfg_list).sort("item_id")
+
+    # item_id=1 → only in cg_a (rank=1).
+    row1 = out.filter(pl.col("item_id") == 1).row(0, named=True)
+    assert row1["cg_count"] == 1
+    assert row1["cg_min_rank"] == pytest.approx(1.0)
+    assert row1["cg_max_rank"] == pytest.approx(1.0)
+    assert row1["cg_mean_rank"] == pytest.approx(1.0)
+    assert row1["cg_rrf_score"] == pytest.approx(1.0 / 61.0, rel=1e-5)
+
+    # item_id=4 → cg_a (rank=4) AND cg_b (rank=1). Both contribute.
+    row4 = out.filter(pl.col("item_id") == 4).row(0, named=True)
+    assert row4["cg_count"] == 2
+    assert row4["cg_min_rank"] == pytest.approx(1.0)
+    assert row4["cg_max_rank"] == pytest.approx(4.0)
+    assert row4["cg_mean_rank"] == pytest.approx(2.5)
+    assert row4["cg_rrf_score"] == pytest.approx(1.0 / 64.0 + 1.0 / 61.0, rel=1e-5)
+
+    # item_id=8 → only in cg_b (rank=5).
+    row8 = out.filter(pl.col("item_id") == 8).row(0, named=True)
+    assert row8["cg_count"] == 1
+    assert row8["cg_min_rank"] == pytest.approx(5.0)
+    assert row8["cg_max_rank"] == pytest.approx(5.0)
+    assert row8["cg_mean_rank"] == pytest.approx(5.0)
+    assert row8["cg_rrf_score"] == pytest.approx(1.0 / 65.0, rel=1e-5)
+
+
+def test_compute_cg_aggregates_score_norm_per_cg_minmax(merged_two_cgs):
+    """``cg_mean_score_norm`` is mean of per-CG MinMax-normalized scores.
+
+    cg_a scores: 1.0, 0.5, 0.333, 0.25, 0.2 → range [0.2, 1.0]
+    cg_b scores: 0.5, 0.25, 0.166, 0.125, 0.1 → range [0.1, 0.5]
+    item_id=1 (cg_a only, score=1.0)        → norm_a=(1.0-0.2)/(1.0-0.2) = 1.0; mean=1.0
+    item_id=8 (cg_b only, score=0.1)        → norm_b=(0.1-0.1)/(0.5-0.1) = 0.0; mean=0.0
+    """
+    cg_cfg_list = [{"name": "cg_a"}, {"name": "cg_b"}]
+    out = compute_cg_aggregates(merged_two_cgs, cg_cfg_list)
+
+    row1 = out.filter(pl.col("item_id") == 1).row(0, named=True)
+    assert row1["cg_mean_score_norm"] == pytest.approx(1.0, abs=1e-5)
+
+    row8 = out.filter(pl.col("item_id") == 8).row(0, named=True)
+    assert row8["cg_mean_score_norm"] == pytest.approx(0.0, abs=1e-5)
+
+    # All values in [0, 1] (both CGs are MinMax-normalized to [0, 1]
+    # before the horizontal mean).
+    norms = out["cg_mean_score_norm"].to_list()
+    assert all(0.0 - 1e-5 <= v <= 1.0 + 1e-5 for v in norms)
+
+
+def test_compute_cg_aggregates_does_not_mutate_original_score_columns(merged_two_cgs):
+    """Original ``cg_a_score`` / ``cg_b_score`` must be preserved unchanged."""
+    cg_cfg_list = [{"name": "cg_a"}, {"name": "cg_b"}]
+    before_a = merged_two_cgs["cg_a_score"].to_list()
+    before_b = merged_two_cgs["cg_b_score"].to_list()
+    out = compute_cg_aggregates(merged_two_cgs, cg_cfg_list)
+    assert out["cg_a_score"].to_list() == before_a
+    assert out["cg_b_score"].to_list() == before_b
+    # Row count preserved.
+    assert len(out) == len(merged_two_cgs)
+
+
+def test_compute_cg_aggregates_missing_cg_in_merged_skipped(merged_two_cgs):
+    """A CG named in the cfg list but absent from the DataFrame is ignored
+    (e.g. someone disabled a CG without removing its config block)."""
+    cg_cfg_list = [
+        {"name": "cg_a"},
+        {"name": "cg_b"},
+        {"name": "cg_phantom"},  # no cg_phantom_rank column in merged
+    ]
+    out = compute_cg_aggregates(merged_two_cgs, cg_cfg_list)
+    # Same behaviour as the 2-CG case for cg_count on item 4 (both real CGs).
+    row4 = out.filter(pl.col("item_id") == 4).row(0, named=True)
+    assert row4["cg_count"] == 2
+
+
+def test_compute_cg_aggregates_no_rank_columns_returns_unchanged():
+    """Empty cfg or all CGs absent from merged → no-op (no aggregate cols)."""
+    df = pl.DataFrame({
+        "uid": [1, 1, 2],
+        "item_id": [10, 20, 30],
+    }).with_columns([
+        pl.col("uid").cast(pl.Int64),
+        pl.col("item_id").cast(pl.Int64),
+    ])
+    cg_cfg_list = [{"name": "cg_missing"}]  # not in df
+    out = compute_cg_aggregates(df, cg_cfg_list)
+    assert out.equals(df)
+
+
+def test_compute_cg_aggregates_constant_score_column_skipped():
+    """If a CG's score column is constant, MinMax normalization is undefined
+    → that CG is dropped from the score-norm mean (other CGs still count)."""
+    cg_a = _cg_df("cg_a", [(1, 10, 1.0, 1), (1, 20, 0.5, 2)])
+    cg_b = _cg_df("cg_b", [(1, 10, 0.7, 1), (1, 20, 0.7, 2)])  # constant
+    merged = merge_candidates({"cg_a": cg_a, "cg_b": cg_b})
+    out = compute_cg_aggregates(merged, [{"name": "cg_a"}, {"name": "cg_b"}])
+
+    # cg_b score is constant — only cg_a contributes to cg_mean_score_norm.
+    # cg_a scores 1.0/0.5 normalize to 1.0/0.0 → mean per row = 1.0/0.0.
+    rows = {r["item_id"]: r for r in out.iter_rows(named=True)}
+    assert rows[10]["cg_mean_score_norm"] == pytest.approx(1.0, abs=1e-5)
+    assert rows[20]["cg_mean_score_norm"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_compute_cg_aggregates_rrf_uses_only_present_ranks():
+    """RRF must skip null ranks (CG didn't return that item) — the
+    ``fill_null(0.0)`` after the 1/(k+rank) inverse is what implements
+    that, so a CG that didn't contribute adds 0 to the sum."""
+    cg_a = _cg_df("cg_a", [(1, 10, 0.9, 5)])  # only cg_a sees item 10
+    cg_b = _cg_df("cg_b", [(1, 99, 0.1, 5)])  # only cg_b sees item 99
+    merged = merge_candidates({"cg_a": cg_a, "cg_b": cg_b})
+    out = compute_cg_aggregates(merged, [{"name": "cg_a"}, {"name": "cg_b"}])
+    # item 10 → only cg_a contributes; rrf = 1/(60+5) + 0
+    rows = {r["item_id"]: r for r in out.iter_rows(named=True)}
+    assert rows[10]["cg_rrf_score"] == pytest.approx(1.0 / 65.0, rel=1e-5)
+    assert rows[99]["cg_rrf_score"] == pytest.approx(1.0 / 65.0, rel=1e-5)
+    assert rows[10]["cg_count"] == 1
+    assert rows[99]["cg_count"] == 1
+
+
 # ── cg_recall (sanity, unchanged behaviour) ──────────────────────────────
 
 

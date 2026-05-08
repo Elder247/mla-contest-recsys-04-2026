@@ -217,54 +217,51 @@ def compute_cg_aggregates(
         len(rank_cols), len(score_cols), len(merged),
     )
 
+    # All horizontal reductions in Float64 — Polars panics ("cannot get ref
+    # Float32 from Float64") if we cast intermediate ``min/max/mean_horizontal``
+    # outputs to Float32 because the engine's planned dtype for the reduction
+    # disagrees with the cast. Cast only the materialised output Series.
+    rank_cols_f64 = [pl.col(c).cast(pl.Float64) for c in rank_cols]
     not_null_terms = [pl.col(c).is_not_null().cast(pl.Int32) for c in rank_cols]
-    cg_count_expr = pl.sum_horizontal(*not_null_terms).cast(pl.Int32).alias("cg_count")
-    cg_min_rank_expr = pl.min_horizontal(*[pl.col(c) for c in rank_cols]).cast(pl.Float32).alias("cg_min_rank")
-    cg_max_rank_expr = pl.max_horizontal(*[pl.col(c) for c in rank_cols]).cast(pl.Float32).alias("cg_max_rank")
-    cg_mean_rank_expr = pl.mean_horizontal(*[pl.col(c) for c in rank_cols]).cast(pl.Float32).alias("cg_mean_rank")
     rrf_terms = [
-        (1.0 / (_RRF_K + pl.col(c).cast(pl.Float32))).fill_null(0.0)
+        (1.0 / (_RRF_K + pl.col(c).cast(pl.Float64))).fill_null(0.0)
         for c in rank_cols
     ]
-    cg_rrf_score_expr = pl.sum_horizontal(*rrf_terms).cast(pl.Float32).alias("cg_rrf_score")
 
     out = merged.with_columns([
-        cg_count_expr,
-        cg_min_rank_expr,
-        cg_max_rank_expr,
-        cg_mean_rank_expr,
-        cg_rrf_score_expr,
+        pl.sum_horizontal(*not_null_terms).cast(pl.Int32).alias("cg_count"),
+        pl.min_horizontal(*rank_cols_f64).alias("cg_min_rank"),
+        pl.max_horizontal(*rank_cols_f64).alias("cg_max_rank"),
+        pl.mean_horizontal(*rank_cols_f64).alias("cg_mean_rank"),
+        pl.sum_horizontal(*rrf_terms).alias("cg_rrf_score"),
+    ]).with_columns([
+        pl.col("cg_min_rank").cast(pl.Float32),
+        pl.col("cg_max_rank").cast(pl.Float32),
+        pl.col("cg_mean_rank").cast(pl.Float32),
+        pl.col("cg_rrf_score").cast(pl.Float32),
     ])
 
     # ── MinMax-normalised score aggregate ────────────────────────────────────
     # Per-CG: (score - min) / (max - min), null preserved. Then mean across CGs
-    # ignoring nulls. Skip CGs whose score column is fully null (degenerate).
-    if score_cols:
-        norm_terms = []
-        for sc in score_cols:
-            s_min = out[sc].min()
-            s_max = out[sc].max()
-            if s_min is None or s_max is None or s_min == s_max:
-                # All-null or constant column → skip (mean_horizontal ignores nulls).
-                continue
-            # Cast to Float32 explicitly; literals are inferred as Float64 otherwise.
-            norm_terms.append(
-                ((pl.col(sc) - float(s_min)) / (float(s_max) - float(s_min)))
-                .cast(pl.Float32)
-            )
-        if norm_terms:
-            out = out.with_columns(
-                pl.mean_horizontal(*norm_terms)
-                .cast(pl.Float32)
-                .alias("cg_mean_score_norm")
-            )
-        else:
-            out = out.with_columns(
-                pl.lit(None, dtype=pl.Float32).alias("cg_mean_score_norm")
-            )
+    # ignoring nulls. Skip CGs whose score column is fully null or constant
+    # (no meaningful normalisation).
+    norm_terms: list[pl.Expr] = []
+    for sc in score_cols:
+        s_min = out[sc].min()
+        s_max = out[sc].max()
+        if s_min is None or s_max is None or s_min == s_max:
+            continue
+        norm_terms.append(
+            (pl.col(sc).cast(pl.Float64) - float(s_min))
+            / (float(s_max) - float(s_min))
+        )
+    if norm_terms:
+        out = out.with_columns(
+            pl.mean_horizontal(*norm_terms).alias("cg_mean_score_norm")
+        ).with_columns(pl.col("cg_mean_score_norm").cast(pl.Float32))
     else:
         out = out.with_columns(
-            pl.lit(None, dtype=pl.Float32).alias("cg_mean_score_norm")
+            pl.lit(None).cast(pl.Float32).alias("cg_mean_score_norm")
         )
 
     return out
