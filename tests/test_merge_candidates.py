@@ -7,6 +7,7 @@ import pytest
 from src.inference.merge_candidates import (
     apply_n_cand_keep,
     cg_recall,
+    compute_cg_aggregates,
     merge_candidates,
 )
 

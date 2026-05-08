@@ -180,6 +180,96 @@ def apply_n_cand_keep(
     return filtered
 
 
+_RRF_K = 60.0
+
+
+def compute_cg_aggregates(
+    merged: pl.DataFrame,
+    cg_cfg_list: Iterable[Any],
+) -> pl.DataFrame:
+    """Append per-row aggregate features over the CG ``{name}_rank`` /
+    ``{name}_score`` columns. Adds 6 Float32 columns:
+
+      - ``cg_count``           — number of CGs that contributed this row
+      - ``cg_min_rank``        — best (smallest) rank across CGs
+      - ``cg_max_rank``        — worst rank across CGs
+      - ``cg_mean_rank``       — mean of non-null ranks
+      - ``cg_rrf_score``       — sum of ``1/(60+rank_i)`` over non-null ranks
+      - ``cg_mean_score_norm`` — mean of MinMax-normalized scores (per-CG
+                                 normalization on the visible pool; only
+                                 the aggregate is normalized — original
+                                 ``{name}_score`` columns are untouched)
+
+    Polars' ``*_horizontal`` reductions skip nulls natively; the count is
+    derived from the same masks for consistency. Aggregates are intentionally
+    computed *after* :func:`apply_n_cand_keep` so feature distributions
+    match what the production ranker will see.
+    """
+    cg_names = [cg.get("name") for cg in cg_cfg_list]
+    rank_cols = [f"{n}_rank" for n in cg_names if f"{n}_rank" in merged.columns]
+    score_cols = [f"{n}_score" for n in cg_names if f"{n}_score" in merged.columns]
+    if not rank_cols:
+        log.info("compute_cg_aggregates: no rank columns in merged — skipping")
+        return merged
+
+    log.info(
+        "compute_cg_aggregates: %d rank cols, %d score cols on %d rows",
+        len(rank_cols), len(score_cols), len(merged),
+    )
+
+    not_null_terms = [pl.col(c).is_not_null().cast(pl.Int32) for c in rank_cols]
+    cg_count_expr = pl.sum_horizontal(*not_null_terms).cast(pl.Int32).alias("cg_count")
+    cg_min_rank_expr = pl.min_horizontal(*[pl.col(c) for c in rank_cols]).cast(pl.Float32).alias("cg_min_rank")
+    cg_max_rank_expr = pl.max_horizontal(*[pl.col(c) for c in rank_cols]).cast(pl.Float32).alias("cg_max_rank")
+    cg_mean_rank_expr = pl.mean_horizontal(*[pl.col(c) for c in rank_cols]).cast(pl.Float32).alias("cg_mean_rank")
+    rrf_terms = [
+        (1.0 / (_RRF_K + pl.col(c).cast(pl.Float32))).fill_null(0.0)
+        for c in rank_cols
+    ]
+    cg_rrf_score_expr = pl.sum_horizontal(*rrf_terms).cast(pl.Float32).alias("cg_rrf_score")
+
+    out = merged.with_columns([
+        cg_count_expr,
+        cg_min_rank_expr,
+        cg_max_rank_expr,
+        cg_mean_rank_expr,
+        cg_rrf_score_expr,
+    ])
+
+    # ── MinMax-normalised score aggregate ────────────────────────────────────
+    # Per-CG: (score - min) / (max - min), null preserved. Then mean across CGs
+    # ignoring nulls. Skip CGs whose score column is fully null (degenerate).
+    if score_cols:
+        norm_terms = []
+        for sc in score_cols:
+            s_min = out[sc].min()
+            s_max = out[sc].max()
+            if s_min is None or s_max is None or s_min == s_max:
+                # All-null or constant column → skip (mean_horizontal ignores nulls).
+                continue
+            # Cast to Float32 explicitly; literals are inferred as Float64 otherwise.
+            norm_terms.append(
+                ((pl.col(sc) - float(s_min)) / (float(s_max) - float(s_min)))
+                .cast(pl.Float32)
+            )
+        if norm_terms:
+            out = out.with_columns(
+                pl.mean_horizontal(*norm_terms)
+                .cast(pl.Float32)
+                .alias("cg_mean_score_norm")
+            )
+        else:
+            out = out.with_columns(
+                pl.lit(None, dtype=pl.Float32).alias("cg_mean_score_norm")
+            )
+    else:
+        out = out.with_columns(
+            pl.lit(None, dtype=pl.Float32).alias("cg_mean_score_norm")
+        )
+
+    return out
+
+
 def cg_recall(
     candidates: pl.DataFrame,
     ground_truth: pl.DataFrame,

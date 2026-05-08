@@ -45,7 +45,11 @@ from src.data.dataset import (
     positive_listens,
 )
 from src.data.features import add_features
-from src.inference.merge_candidates import apply_n_cand_keep, merge_candidates
+from src.inference.merge_candidates import (
+    apply_n_cand_keep,
+    compute_cg_aggregates,
+    merge_candidates,
+)
 from src.inference.pipeline import apply_exclude_filter, load_eval_users
 from src.training.cg_cache import cg_cache_path, fit_or_load_cg
 
@@ -201,6 +205,12 @@ def generate_phase(
     # Optional post-merge row filter — see apply_n_cand_keep docstring.
     # No-op when no CG block has the ``n_cand_keep`` field set.
     merged = apply_n_cand_keep(merged, cg_cfg_list)
+    gc.collect()
+
+    # Per-row CG-aggregate ranker features (cg_count, mean/min/max_rank,
+    # rrf_score, mean_score_norm). Computed after the keep-filter so the
+    # aggregates reflect the production-visible pool.
+    merged = compute_cg_aggregates(merged, cg_cfg_list)
     gc.collect()
 
     if filter_dislikes:
