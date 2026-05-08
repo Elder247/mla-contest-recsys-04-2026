@@ -503,31 +503,45 @@ def build_embed_features(
     undislikes_lf: pl.LazyFrame,
     embeddings_path: str,
     cutoff_ts: int,
-    last_k: int = 20,
+    last_k_list: list[int] | None = None,
 ) -> pl.LazyFrame:
     """Per-candidate audio-embedding cosine features (key: ``(uid, item_id)``).
 
-    Four ranker features — orthogonal to the AudioEmbedKNN CG (which does
+    Ranker features — orthogonal to the AudioEmbedKNN CG (which does
     *retrieval*; these features give CatBoost a per-candidate similarity
     score it can weigh against other signals):
 
-      * ``embed_cos_user_mean``       — vs L2-normed mean of all user listens
-      * ``embed_cos_user_last_k``     — vs mean of last ``last_k`` listens
-      * ``embed_cos_user_liked_mean`` — vs mean of effective likes (likes − unlikes)
+      * ``embed_cos_user_mean``        — vs L2-normed mean of all user listens
+      * ``embed_cos_user_last_{K}``    — vs mean of last K listens (one per K
+                                          in ``last_k_list``; default 5/20/50/100)
+      * ``embed_cos_user_liked_mean``  — vs mean of effective likes (likes − unlikes)
       * ``embed_cos_user_disliked_mean`` — vs mean of effective dislikes (negative signal)
+
+    Multi-window ``last_K`` cosines capture user intent at different time
+    scales: K=5 = current session, K=20 ≈ today, K=50 ≈ this week, K=100 ≈
+    this month. Each K is computed by re-aggregating the **same**
+    pre-loaded listen pairs — no extra parquet scans.
 
     Implementation: materialises only the rows / items needed (semi-join on
     candidate items + per-user history items), loads embeddings restricted
-    to that set, builds 4 user-mean vectors via numpy scatter-add, then
+    to that set, builds the user-mean vectors via numpy scatter-add, then
     rows-row dot product with the item embedding for each candidate.
 
     Items / users with no embedding coverage emit NULL — CatBoost handles
     that via ``nan_mode="Min"``. Cosine = inner-product because embeddings
     are L2-normalised in the parquet (``normalized_embed``).
 
-    Returns a LazyFrame keyed by ``(uid, item_id)`` with the 4 cos columns
-    (``Float32``), suitable for left-join in :func:`add_features`.
+    Returns a LazyFrame keyed by ``(uid, item_id)`` with ``2 + 1 + 1 + len(last_k_list)``
+    Float32 cosine columns, suitable for left-join in :func:`add_features`.
     """
+    if last_k_list is None:
+        last_k_list = [5, 20, 50, 100]
+    # Stable de-dup + sort to keep column order deterministic.
+    last_k_list = sorted({int(k) for k in last_k_list})
+    if not last_k_list or any(k <= 0 for k in last_k_list):
+        raise ValueError(
+            f"last_k_list must be non-empty positive ints; got {last_k_list}"
+        )
     cand_pairs_eager = (
         candidates_lf
         .select(["uid", "item_id"])
@@ -589,7 +603,7 @@ def build_embed_features(
     )
     if len(emb_df) == 0:
         log.warning("build_embed_features: no embeddings matched — returning NULL features")
-        return _empty_embed_frame(cand_pairs_eager).lazy()
+        return _empty_embed_frame(cand_pairs_eager, last_k_list).lazy()
 
     # .to_list() on a List(Float64) column creates a Python list-of-lists (~8 GB peak
     # for 1.8M×128 items). explode() → 1-D Float32 series → zero-copy numpy → reshape
@@ -630,9 +644,14 @@ def build_embed_features(
     )
 
     mean_all = _user_mean_embeddings(listens_user_item, item_to_row, emb_arr, dim)
-    mean_lastk = _user_mean_last_k(listens_user_item, last_k, item_to_row, emb_arr, dim)
     mean_liked = _user_mean_embeddings(likes_user_item, item_to_row, emb_arr, dim)
     mean_disliked = _user_mean_embeddings(dislikes_user_item, item_to_row, emb_arr, dim)
+    # One user-mean vector per window K — same pre-loaded listens, just a
+    # different per-user .head(K) slice. Cheap relative to the embedding load.
+    mean_lastk_per_k: dict[int, tuple[dict[int, int], np.ndarray]] = {
+        k: _user_mean_last_k(listens_user_item, k, item_to_row, emb_arr, dim)
+        for k in last_k_list
+    }
 
     # ── Compute 4 cosines per candidate ──────────────────────────────────────
     # Old approach: emb_arr[ir] where |ir|=5M creates a 5M×128 float32 copy
@@ -677,19 +696,23 @@ def build_embed_features(
         return out
 
     cos_all = _cos_sorted(*mean_all)
-    cos_lastk = _cos_sorted(*mean_lastk)
     cos_liked = _cos_sorted(*mean_liked)
     cos_disliked = _cos_sorted(*mean_disliked)
+    cos_lastk_per_k = {k: _cos_sorted(*mean_lastk_per_k[k]) for k in last_k_list}
+
+    out_cols: dict[str, np.ndarray] = {
+        "uid": uid_arr,
+        "item_id": iid_arr,
+        "embed_cos_user_mean": cos_all,
+    }
+    # Insert all last_K cosines in ascending K order — keeps schema stable.
+    for k in last_k_list:
+        out_cols[f"embed_cos_user_last_{k}"] = cos_lastk_per_k[k]
+    out_cols["embed_cos_user_liked_mean"] = cos_liked
+    out_cols["embed_cos_user_disliked_mean"] = cos_disliked
 
     return (
-        pl.DataFrame({
-            "uid": uid_arr,
-            "item_id": iid_arr,
-            "embed_cos_user_mean": cos_all,
-            "embed_cos_user_last_k": cos_lastk,
-            "embed_cos_user_liked_mean": cos_liked,
-            "embed_cos_user_disliked_mean": cos_disliked,
-        })
+        pl.DataFrame(out_cols)
         .with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
         .lazy()
     )
@@ -813,18 +836,29 @@ def _user_mean_last_k(
     return _user_mean_embeddings(last_k_df, item_to_row, emb_arr, dim)
 
 
-def _empty_embed_frame(cand_pairs: pl.DataFrame) -> pl.DataFrame:
-    """All-NULL embed feature frame for the case of no embedding coverage."""
+def _empty_embed_frame(
+    cand_pairs: pl.DataFrame,
+    last_k_list: list[int],
+) -> pl.DataFrame:
+    """All-NULL embed feature frame for the case of no embedding coverage.
+
+    Schema must match the populated path in :func:`build_embed_features` —
+    one ``embed_cos_user_last_{K}`` column per K in ``last_k_list``.
+    """
     n = len(cand_pairs)
-    null_col = np.full(n, np.nan, dtype=np.float32)
-    return pl.DataFrame({
+    cols: dict[str, np.ndarray] = {
         "uid": cand_pairs["uid"].to_numpy(),
         "item_id": cand_pairs["item_id"].to_numpy(),
-        "embed_cos_user_mean": null_col,
-        "embed_cos_user_last_k": null_col,
-        "embed_cos_user_liked_mean": null_col,
-        "embed_cos_user_disliked_mean": null_col,
-    }).with_columns([pl.col("uid").cast(pl.Int64), pl.col("item_id").cast(pl.Int64)])
+        "embed_cos_user_mean": np.full(n, np.nan, dtype=np.float32),
+    }
+    for k in last_k_list:
+        cols[f"embed_cos_user_last_{k}"] = np.full(n, np.nan, dtype=np.float32)
+    cols["embed_cos_user_liked_mean"] = np.full(n, np.nan, dtype=np.float32)
+    cols["embed_cos_user_disliked_mean"] = np.full(n, np.nan, dtype=np.float32)
+    return pl.DataFrame(cols).with_columns([
+        pl.col("uid").cast(pl.Int64),
+        pl.col("item_id").cast(pl.Int64),
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +877,7 @@ def add_features(
     cutoff_ts: int,
     decay_half_life_units: int = DEFAULT_DECAY_HALF_LIFE,
     embeddings_path: str | None = None,
-    embed_last_k: int = 20,
+    embed_last_k_list: list[int] | None = None,
 ) -> pl.LazyFrame:
     """Enrich candidates with user / item / pair / cross / embed features.
 
@@ -894,7 +928,8 @@ def add_features(
         embed_feats = build_embed_features(
             candidates_lf, listens_lf, likes_lf, unlikes_lf,
             dislikes_lf, undislikes_lf,
-            embeddings_path, cutoff_ts, embed_last_k,
+            embeddings_path, cutoff_ts,
+            last_k_list=embed_last_k_list,  # None → default [5, 20, 50, 100]
         )
         enriched_cands = enriched_cands.join(embed_feats, on=["uid", "item_id"], how="left")
 

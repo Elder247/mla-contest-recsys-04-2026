@@ -142,12 +142,17 @@ def test_embed_features_returns_4_cosines_for_known_user(emb_parquet):
     out = build_embed_features(
         cands, listens_lf, likes_lf=empty, unlikes_lf=empty,
         dislikes_lf=empty, undislikes_lf=empty,
-        embeddings_path=str(emb_path), cutoff_ts=cutoff, last_k=20,
+        embeddings_path=str(emb_path), cutoff_ts=cutoff,
+        last_k_list=[5, 20, 50, 100],
     ).collect()
 
+    # Schema: uid, item_id, embed_cos_user_mean, then last_K cols in ascending K,
+    # then liked_mean, disliked_mean.
     assert out.columns == [
         "uid", "item_id",
-        "embed_cos_user_mean", "embed_cos_user_last_k",
+        "embed_cos_user_mean",
+        "embed_cos_user_last_5", "embed_cos_user_last_20",
+        "embed_cos_user_last_50", "embed_cos_user_last_100",
         "embed_cos_user_liked_mean", "embed_cos_user_disliked_mean",
     ]
     assert len(out) == 1
@@ -159,6 +164,10 @@ def test_embed_features_returns_4_cosines_for_known_user(emb_parquet):
     user_mean /= np.linalg.norm(user_mean)
     expected_cos_mean = float(norm_emb[item_idx[30]] @ user_mean)
     assert row["embed_cos_user_mean"] == pytest.approx(expected_cos_mean, abs=1e-5)
+    # User has only 2 listens — every K window in the list collapses to the
+    # same set of items, so each ``last_K`` cosine equals ``user_mean`` cosine.
+    for k in (5, 20, 50, 100):
+        assert row[f"embed_cos_user_last_{k}"] == pytest.approx(expected_cos_mean, abs=1e-5)
 
     # No likes / dislikes → those columns are NULL
     assert row["embed_cos_user_liked_mean"] is None or np.isnan(row["embed_cos_user_liked_mean"])
@@ -186,7 +195,9 @@ def test_embed_features_missing_item_returns_null(emb_parquet):
     ).collect()
     row = out.row(0, named=True)
     for col in [
-        "embed_cos_user_mean", "embed_cos_user_last_k",
+        "embed_cos_user_mean",
+        "embed_cos_user_last_5", "embed_cos_user_last_20",
+        "embed_cos_user_last_50", "embed_cos_user_last_100",
         "embed_cos_user_liked_mean", "embed_cos_user_disliked_mean",
     ]:
         assert row[col] is None or np.isnan(row[col]), f"{col}={row[col]} expected NaN"
@@ -213,7 +224,9 @@ def test_embed_features_user_with_no_history_returns_null(emb_parquet):
     ).collect()
     row = out.row(0, named=True)
     for col in [
-        "embed_cos_user_mean", "embed_cos_user_last_k",
+        "embed_cos_user_mean",
+        "embed_cos_user_last_5", "embed_cos_user_last_20",
+        "embed_cos_user_last_50", "embed_cos_user_last_100",
         "embed_cos_user_liked_mean", "embed_cos_user_disliked_mean",
     ]:
         assert row[col] is None or np.isnan(row[col])
@@ -260,9 +273,10 @@ def test_add_features_emits_pair_recency_ratio_and_embed_cols(emb_parquet):
     assert "pair_avg_played_ratio_30d" in cols
     assert "pair_max_played_ratio_30d" in cols
     assert "pair_recency_ratio" in cols
-    # D4 outputs
+    # D4 outputs (multi-window: H3)
     assert "embed_cos_user_mean" in cols
-    assert "embed_cos_user_last_k" in cols
+    for k in (5, 20, 50, 100):
+        assert f"embed_cos_user_last_{k}" in cols
     assert "embed_cos_user_liked_mean" in cols
     assert "embed_cos_user_disliked_mean" in cols
 
