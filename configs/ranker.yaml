@@ -15,6 +15,10 @@ filter_dislikes: true
 cache_features: false
 compute_feature_importance: true
 enable_embed_features: true
+# 0 / null → original single-pass features build. >0 → process candidates in
+# uid-blocks of this size to bound features_lf.collect() peak memory.
+# 500m eval (10k uids → 45M rows): use 2500–3000 to stay under 80 GB.
+feature_chunk_size: 0
 artifacts_root: /home/astrofimuk/dc-remote/artifacts
 output_dir: ${artifacts_root}
 ranker_dir: ${artifacts_root}

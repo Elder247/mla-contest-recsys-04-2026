@@ -146,6 +146,7 @@ def main(cfg: DictConfig) -> None:
         _hydra_override("artifacts_root", cfg.artifacts_root),
         _hydra_override("data.root", cfg.data.root),
         _hydra_override("enable_embed_features", bool(cfg.get("enable_embed_features", True))),
+        _hydra_override("feature_chunk_size", int(cfg.get("feature_chunk_size", 0) or 0)),
         _hydra_override("merged_path", str(merged_path)),
         _hydra_override("output_path", str(feats_path)),
         _hydra_override("cutoff_ts", cutoff_ts),

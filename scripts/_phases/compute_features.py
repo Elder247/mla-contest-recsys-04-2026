@@ -53,6 +53,9 @@ def main(cfg: DictConfig) -> None:
     enable_embed = bool(cfg.get("enable_embed_features", True))
     embeddings_path = cfg.data.embeddings if enable_embed else None
 
+    chunk_size = cfg.get("feature_chunk_size", 0)
+    chunk_size_uids = int(chunk_size) if chunk_size else None
+
     features_phase(
         merged_path=merged_path,
         listens_path=cfg.data.listens,
@@ -66,6 +69,7 @@ def main(cfg: DictConfig) -> None:
         output_path=output_path,
         embeddings_path=embeddings_path,
         label_gt_path=label_gt_path,
+        chunk_size_uids=chunk_size_uids,
     )
 
 

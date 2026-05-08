@@ -23,6 +23,7 @@ that lets the same code scale to 500m / 5B.
 """
 from __future__ import annotations
 
+import gc
 import logging
 
 import numpy as np
@@ -624,34 +625,43 @@ def build_embed_features(
 
     # ── Build user mean vectors (4 variants) ─────────────────────────────────
     # All means produce arrays of shape (n_users, dim) indexed by ``uids_with_*``.
+    # Drop each per-history eager DF as soon as its mean(s) are computed —
+    # on 500m these are multi-GB and otherwise live until function return.
     listens_user_item = (
         L_pos
         .filter(pl.col("item_id").is_in(items_needed))
         .select(["uid", "item_id", "timestamp"])
         .collect()
     )
-    likes_user_item = (
-        likes_active
-        .filter(pl.col("item_id").is_in(items_needed))
-        .select(["uid", "item_id"])
-        .collect()
-    )
-    dislikes_user_item = (
-        dislikes_active
-        .filter(pl.col("item_id").is_in(items_needed))
-        .select(["uid", "item_id"])
-        .collect()
-    )
-
     mean_all = _user_mean_embeddings(listens_user_item, item_to_row, emb_arr, dim)
-    mean_liked = _user_mean_embeddings(likes_user_item, item_to_row, emb_arr, dim)
-    mean_disliked = _user_mean_embeddings(dislikes_user_item, item_to_row, emb_arr, dim)
     # One user-mean vector per window K — same pre-loaded listens, just a
     # different per-user .head(K) slice. Cheap relative to the embedding load.
     mean_lastk_per_k: dict[int, tuple[dict[int, int], np.ndarray]] = {
         k: _user_mean_last_k(listens_user_item, k, item_to_row, emb_arr, dim)
         for k in last_k_list
     }
+    del listens_user_item
+    gc.collect()
+
+    likes_user_item = (
+        likes_active
+        .filter(pl.col("item_id").is_in(items_needed))
+        .select(["uid", "item_id"])
+        .collect()
+    )
+    mean_liked = _user_mean_embeddings(likes_user_item, item_to_row, emb_arr, dim)
+    del likes_user_item
+    gc.collect()
+
+    dislikes_user_item = (
+        dislikes_active
+        .filter(pl.col("item_id").is_in(items_needed))
+        .select(["uid", "item_id"])
+        .collect()
+    )
+    mean_disliked = _user_mean_embeddings(dislikes_user_item, item_to_row, emb_arr, dim)
+    del dislikes_user_item
+    gc.collect()
 
     # ── Compute 4 cosines per candidate ──────────────────────────────────────
     # Old approach: emb_arr[ir] where |ir|=5M creates a 5M×128 float32 copy
@@ -699,6 +709,20 @@ def build_embed_features(
     cos_liked = _cos_sorted(*mean_liked)
     cos_disliked = _cos_sorted(*mean_disliked)
     cos_lastk_per_k = {k: _cos_sorted(*mean_lastk_per_k[k]) for k in last_k_list}
+
+    # Release the embedding matrix (~730 MB on 500m) and all per-user-mean
+    # arrays + sort scratch BEFORE we build the output DataFrame and return.
+    # Otherwise these stay alive through the downstream Polars hash-joins
+    # in add_features → contributes to OOM during features_lf.collect().
+    # Killing _cos_sorted / _item_rows releases their cell-captured references
+    # to emb_arr / sort_order / s_irows / etc.
+    del emb_arr, emb_item_ids, item_to_row
+    del mean_all, mean_liked, mean_disliked, mean_lastk_per_k
+    del s_uids, s_irows, item_rows_all, sort_order
+    del block_starts, block_ends, block_uids, uid_changes
+    del emb_sorted_pos, emb_sorted_ids
+    del _cos_sorted, _item_rows
+    gc.collect()
 
     out_cols: dict[str, np.ndarray] = {
         "uid": uid_arr,
@@ -826,9 +850,18 @@ def _user_mean_last_k(
     """User mean over their last ``last_k`` listens (chronological)."""
     if len(listens_pairs) == 0:
         return {}, np.zeros((0, dim), dtype=np.float32)
+    # Tiebreaker by item_id makes head(K) deterministic when several
+    # listens for the same user share a timestamp (Yambda bins ts to 5s
+    # buckets so collisions are common). Without it, the row-order of
+    # ``listens_pairs`` leaks into the result — chunked vs single-pass
+    # builds produce different "last K" item sets and thus different
+    # embed_cos_user_last_{K} values for affected users.
     last_k_df = (
         listens_pairs
-        .sort(["uid", "timestamp"], descending=[False, True])
+        .sort(
+            ["uid", "timestamp", "item_id"],
+            descending=[False, True, False],
+        )
         .group_by("uid", maintain_order=True)
         .head(last_k)
         .select(["uid", "item_id"])

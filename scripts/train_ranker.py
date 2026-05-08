@@ -226,6 +226,7 @@ def main(cfg: DictConfig) -> None:
         _hydra_override("artifacts_root", cfg.artifacts_root),
         _hydra_override("data.root", cfg.data.root),
         _hydra_override("enable_embed_features", bool(cfg.get("enable_embed_features", True))),
+        _hydra_override("feature_chunk_size", int(cfg.get("feature_chunk_size", 0) or 0)),
         _hydra_override("cutoff_ts", train_cutoff_ts),
     ]
     _run_phase("scripts/_phases/compute_features.py", common_feat + [

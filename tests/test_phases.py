@@ -74,11 +74,26 @@ def synth_paths(tmp_path):
     likes_path = tmp_path / "likes.parquet"
     _write_feedback_parquet(likes_path, [(1, 10, cutoff - 1 * ONE_DAY_TS, 1)])
     dislikes_path = tmp_path / "dislikes.parquet"
-    _write_feedback_parquet(dislikes_path, [])
+    _write_feedback_parquet(
+        dislikes_path,
+        [(uid, 99, cutoff - 10 * ONE_DAY_TS, 1) for uid in (1, 2, 3)],
+    )
     unlikes_path = tmp_path / "unlikes.parquet"
-    _write_feedback_parquet(unlikes_path, [])
+    # Non-empty unlikes/undislikes that *cover every candidate uid* —
+    # Polars' optimizer otherwise folds ``pl.lit(1).alias(...)`` over the
+    # post-left-join all-null column into a literal that downstream
+    # group-bys can't aggregate ("cannot aggregate a literal"). Production
+    # 500m / 5b never sees this case (unlikes are dense). Keep the fixture
+    # realistic so the optimizer takes the same plan as production.
+    _write_feedback_parquet(
+        unlikes_path,
+        [(uid, 99, cutoff - 9 * ONE_DAY_TS, 1) for uid in (1, 2, 3)],
+    )
     undislikes_path = tmp_path / "undislikes.parquet"
-    _write_feedback_parquet(undislikes_path, [])
+    _write_feedback_parquet(
+        undislikes_path,
+        [(uid, 99, cutoff - 8 * ONE_DAY_TS, 1) for uid in (1, 2, 3)],
+    )
 
     artist_path = tmp_path / "artist_map.parquet"
     _write_mapping_parquet(artist_path, [(100, 10), (100, 20), (200, 30)], "artist_id")
@@ -143,6 +158,161 @@ def test_features_phase_unlabeled(synth_paths):
         "user_artist_listens", "user_artist_share",
     ]:
         assert col in feats.columns, f"missing feature column: {col}"
+
+
+def _write_chunked_synth(p, listens_extra=None):
+    """Add a 4th uid to the base fixture so chunk_size_uids=2 yields two
+    chunks of 2 uids each. Polars' query planner shows pathological
+    behaviour on single-uid pair_features (``cannot aggregate a literal``)
+    that doesn't surface in production where every chunk has thousands of
+    uids — match production conditions in the test."""
+    cutoff = p["cutoff"]
+    extra_listens = listens_extra or [
+        (4, 30, cutoff - 2 * ONE_DAY_TS, 80, 1, 60),
+        (4, 10, cutoff - 6 * ONE_DAY_TS, 90, 1, 60),
+    ]
+    listens_path = p["tmp_path"] / "listens.parquet"
+    existing = pl.read_parquet(str(listens_path))
+    new = pl.DataFrame(
+        {
+            "uid": [r[0] for r in extra_listens],
+            "item_id": [r[1] for r in extra_listens],
+            "timestamp": [r[2] for r in extra_listens],
+            "played_ratio_pct": [r[3] for r in extra_listens],
+            "is_organic": [r[4] for r in extra_listens],
+            "track_length_seconds": [r[5] for r in extra_listens],
+        },
+        schema=existing.schema,
+    )
+    pl.concat([existing, new]).write_parquet(str(listens_path))
+
+
+def test_features_phase_chunked_matches_single_pass(synth_paths):
+    """Chunked path must produce a parquet identical (modulo row order) to
+    the single-pass path on the same inputs.
+
+    Uses chunk_size_uids=2 with 4 uids so each chunk has 2 uids — matches
+    production where every chunk contains thousands of uids and Polars'
+    plan stays on the "normal" path. Single-uid chunks trigger a
+    ``cannot aggregate a literal`` planner edge case in build_pair_features
+    that doesn't reproduce on real-scale data.
+    """
+    p = synth_paths
+    _write_chunked_synth(p)
+    cutoff = p["cutoff"]
+
+    merged = pl.DataFrame({
+        "uid": [1, 1, 2, 3, 3, 4],
+        "item_id": [10, 20, 30, 10, 30, 10],
+        "decaypop_score": [0.5, 0.4, 0.6, 0.3, 0.7, 0.2],
+        "decaypop_rank": [1, 2, 1, 1, 2, 1],
+    }).with_columns([
+        pl.col("uid").cast(pl.Int64),
+        pl.col("item_id").cast(pl.Int64),
+        pl.col("decaypop_score").cast(pl.Float32),
+        pl.col("decaypop_rank").cast(pl.Int32),
+    ])
+    merged_path = p["tmp_path"] / "merged_chunk.parquet"
+    merged.write_parquet(str(merged_path))
+
+    out_single = p["tmp_path"] / "feats_single.parquet"
+    features_phase(
+        merged_path=merged_path,
+        listens_path=p["listens"],
+        likes_path=p["likes"],
+        dislikes_path=p["dislikes"],
+        unlikes_path=p["unlikes"],
+        undislikes_path=p["undislikes"],
+        artist_map_path=p["artist_map"],
+        album_map_path=p["album_map"],
+        cutoff_ts=cutoff,
+        output_path=out_single,
+    )
+
+    out_chunked = p["tmp_path"] / "feats_chunked.parquet"
+    features_phase(
+        merged_path=merged_path,
+        listens_path=p["listens"],
+        likes_path=p["likes"],
+        dislikes_path=p["dislikes"],
+        unlikes_path=p["unlikes"],
+        undislikes_path=p["undislikes"],
+        artist_map_path=p["artist_map"],
+        album_map_path=p["album_map"],
+        cutoff_ts=cutoff,
+        output_path=out_chunked,
+        chunk_size_uids=2,
+    )
+
+    feats_single = pl.read_parquet(out_single).sort(["uid", "item_id"])
+    feats_chunked = pl.read_parquet(out_chunked).sort(["uid", "item_id"])
+
+    assert feats_single.columns == feats_chunked.columns
+    assert len(feats_single) == len(feats_chunked) == len(merged)
+
+    # Per-column equality (frame_equal ignores row order via the .sort above).
+    assert feats_single.equals(feats_chunked), (
+        "chunked features differ from single-pass features:\n"
+        f"single: {feats_single}\nchunked: {feats_chunked}"
+    )
+
+    # Tmp chunk dir must be cleaned up.
+    tmp_dir = out_chunked.parent / f".{out_chunked.stem}_chunks"
+    assert not tmp_dir.exists(), f"tmp chunk dir was not cleaned: {tmp_dir}"
+
+
+def test_features_phase_chunked_with_labels(synth_paths):
+    """Label join must be re-applied per chunk and survive the concat."""
+    p = synth_paths
+    _write_chunked_synth(p)
+    cutoff = p["cutoff"]
+
+    merged = pl.DataFrame({
+        "uid": [1, 1, 2, 3, 4],
+        "item_id": [10, 20, 30, 10, 10],
+        "decaypop_score": [0.5, 0.4, 0.6, 0.3, 0.2],
+        "decaypop_rank": [1, 2, 1, 1, 1],
+    }).with_columns([
+        pl.col("uid").cast(pl.Int64),
+        pl.col("item_id").cast(pl.Int64),
+        pl.col("decaypop_score").cast(pl.Float32),
+        pl.col("decaypop_rank").cast(pl.Int32),
+    ])
+    merged_path = p["tmp_path"] / "merged_chunk_lbl.parquet"
+    merged.write_parquet(str(merged_path))
+
+    gt = pl.DataFrame({"uid": [1, 3], "item_id": [10, 10]}).with_columns([
+        pl.col("uid").cast(pl.Int64),
+        pl.col("item_id").cast(pl.Int64),
+    ])
+    gt_path = p["tmp_path"] / "gt_chunk.parquet"
+    gt.write_parquet(str(gt_path))
+
+    out_path = p["tmp_path"] / "feats_chunked_lbl.parquet"
+    features_phase(
+        merged_path=merged_path,
+        listens_path=p["listens"],
+        likes_path=p["likes"],
+        dislikes_path=p["dislikes"],
+        unlikes_path=p["unlikes"],
+        undislikes_path=p["undislikes"],
+        artist_map_path=p["artist_map"],
+        album_map_path=p["album_map"],
+        cutoff_ts=cutoff,
+        output_path=out_path,
+        label_gt_path=gt_path,
+        chunk_size_uids=2,
+    )
+
+    feats = pl.read_parquet(out_path)
+    assert "label" in feats.columns
+    assert feats.dtypes[feats.columns.index("label")] == pl.Int8
+    label_map = {(r["uid"], r["item_id"]): r["label"] for r in feats.iter_rows(named=True)}
+    assert label_map[(1, 10)] == 1
+    assert label_map[(1, 20)] == 0
+    assert label_map[(2, 30)] == 0
+    assert label_map[(3, 10)] == 1
+    assert label_map[(4, 10)] == 0
 
 
 def test_features_phase_with_labels(synth_paths):

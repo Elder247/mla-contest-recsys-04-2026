@@ -251,8 +251,8 @@ def generate_phase(
 # Phase 3 — features
 # ---------------------------------------------------------------------------
 
-def features_phase(
-    merged_path: str | Path,
+def _build_features_lf_for_chunk(
+    candidates_lf: pl.LazyFrame,
     listens_path: str,
     likes_path: str,
     dislikes_path: str,
@@ -261,26 +261,14 @@ def features_phase(
     artist_map_path: str,
     album_map_path: str,
     cutoff_ts: int,
-    output_path: str | Path,
-    *,
-    embeddings_path: str | None = None,
-    label_gt_path: str | Path | None = None,
-) -> Path:
-    """Compute the full feature table for a candidate parquet.
-
-    When ``label_gt_path`` is given, a ``label`` Int8 column is appended
-    (1 if the (uid, item_id) appears in the GT parquet, 0 otherwise) before
-    feature joins, so the resulting parquet is directly usable as a ranker
-    training table.
-
-    Returns:
-        Path to the features parquet.
+    embeddings_path: str | None,
+    label_gt_path: str | Path | None,
+) -> pl.LazyFrame:
+    """Apply the full add_features chain (with optional label join) to a
+    candidates LazyFrame slice. Each call freshly opens the parquet scans
+    so the LazyFrame planner sees independent inputs (no shared mutable
+    state across chunks).
     """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    candidates_lf = pl.scan_parquet(str(merged_path))
-
     if label_gt_path is not None:
         gt_lf = (
             pl.scan_parquet(str(label_gt_path))
@@ -301,37 +289,191 @@ def features_phase(
             .with_columns(pl.col("label").fill_null(0).cast(pl.Int8))
         )
 
-    listens_lf = pl.scan_parquet(listens_path)
-    likes_lf = pl.scan_parquet(likes_path)
-    dislikes_lf = pl.scan_parquet(dislikes_path)
-    unlikes_lf = pl.scan_parquet(unlikes_path)
-    undislikes_lf = pl.scan_parquet(undislikes_path)
-    artist_map_lf = pl.scan_parquet(artist_map_path)
-    album_map_lf = pl.scan_parquet(album_map_path)
-
-    log.info(
-        "features_phase: cutoff_ts=%d label=%s embeddings=%s",
-        cutoff_ts, label_gt_path is not None, embeddings_path is not None,
-    )
-    features_lf = add_features(
+    return add_features(
         candidates_lf,
-        listens_lf=listens_lf,
-        likes_lf=likes_lf,
-        dislikes_lf=dislikes_lf,
-        unlikes_lf=unlikes_lf,
-        undislikes_lf=undislikes_lf,
-        artist_map_lf=artist_map_lf,
-        album_map_lf=album_map_lf,
+        listens_lf=pl.scan_parquet(listens_path),
+        likes_lf=pl.scan_parquet(likes_path),
+        dislikes_lf=pl.scan_parquet(dislikes_path),
+        unlikes_lf=pl.scan_parquet(unlikes_path),
+        undislikes_lf=pl.scan_parquet(undislikes_path),
+        artist_map_lf=pl.scan_parquet(artist_map_path),
+        album_map_lf=pl.scan_parquet(album_map_path),
         cutoff_ts=cutoff_ts,
         embeddings_path=embeddings_path,
     )
 
-    features = features_lf.collect()
+
+def features_phase(
+    merged_path: str | Path,
+    listens_path: str,
+    likes_path: str,
+    dislikes_path: str,
+    unlikes_path: str,
+    undislikes_path: str,
+    artist_map_path: str,
+    album_map_path: str,
+    cutoff_ts: int,
+    output_path: str | Path,
+    *,
+    embeddings_path: str | None = None,
+    label_gt_path: str | Path | None = None,
+    chunk_size_uids: int | None = None,
+) -> Path:
+    """Compute the full feature table for a candidate parquet.
+
+    When ``label_gt_path`` is given, a ``label`` Int8 column is appended
+    (1 if the (uid, item_id) appears in the GT parquet, 0 otherwise) before
+    feature joins, so the resulting parquet is directly usable as a ranker
+    training table.
+
+    When ``chunk_size_uids`` is set (typically 2000-3000 on 500m), the
+    candidate parquet is processed in disjoint uid-blocks: each chunk is
+    materialised + written to a temp parquet, then ``pl.scan_parquet([...])
+    .sink_parquet`` concatenates them streaming-style. This keeps the peak
+    memory of the final ``collect()`` bounded by ``chunk_size_uids /
+    n_total_uids × full_peak`` (e.g. 2500 / 10000 = 4× reduction).
+
+    The price: ``user_features`` and ``item_features`` aggregations are
+    re-computed per chunk, and the listens parquet is re-scanned per chunk.
+    On 500m this adds ~1-2 minutes per chunk relative to the single-pass
+    path — acceptable trade-off vs OOM.
+
+    Returns:
+        Path to the features parquet.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     log.info(
-        "features_phase: %d rows × %d cols → %s",
-        len(features), len(features.columns), output_path,
+        "features_phase: cutoff_ts=%d label=%s embeddings=%s chunk_size_uids=%s",
+        cutoff_ts, label_gt_path is not None, embeddings_path is not None,
+        chunk_size_uids,
     )
-    features.write_parquet(str(output_path), compression="zstd")
+
+    if chunk_size_uids is None or chunk_size_uids <= 0:
+        candidates_lf = pl.scan_parquet(str(merged_path))
+        features_lf = _build_features_lf_for_chunk(
+            candidates_lf,
+            listens_path=listens_path,
+            likes_path=likes_path,
+            dislikes_path=dislikes_path,
+            unlikes_path=unlikes_path,
+            undislikes_path=undislikes_path,
+            artist_map_path=artist_map_path,
+            album_map_path=album_map_path,
+            cutoff_ts=cutoff_ts,
+            embeddings_path=embeddings_path,
+            label_gt_path=label_gt_path,
+        )
+        features = features_lf.collect()
+        log.info(
+            "features_phase: %d rows × %d cols → %s",
+            len(features), len(features.columns), output_path,
+        )
+        features.write_parquet(str(output_path), compression="zstd")
+        return output_path
+
+    # ── Chunked path ────────────────────────────────────────────────────────
+    all_uids = (
+        pl.scan_parquet(str(merged_path))
+        .select("uid")
+        .unique()
+        .collect()
+        .get_column("uid")
+        .sort()
+        .to_list()
+    )
+    n_uids = len(all_uids)
+    chunks = [
+        all_uids[i : i + chunk_size_uids]
+        for i in range(0, n_uids, chunk_size_uids)
+    ]
+    log.info(
+        "features_phase: chunked path — %d uids → %d chunks of ≤%d uids",
+        n_uids, len(chunks), chunk_size_uids,
+    )
+
+    tmp_dir = output_path.parent / f".{output_path.stem}_chunks"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    chunk_paths: list[Path] = []
+
+    try:
+        n_cols_seen: int | None = None
+        for i, chunk_uids in enumerate(chunks, start=1):
+            log.info(
+                "features_phase: chunk %d/%d — %d uids",
+                i, len(chunks), len(chunk_uids),
+            )
+            # Materialise the chunk eagerly first, then re-wrap as Lazy.
+            # Both ``is_in([literal_list])`` and a semi-join against an
+            # in-memory uid frame trip Polars' optimizer (``cannot aggregate
+            # a literal``) once the resulting LazyFrame is fed into
+            # add_features's downstream group-bys. Eager materialisation of
+            # the (already small) chunk slice sidesteps the optimizer
+            # interaction without changing semantics.
+            chunk_uid_set = set(int(u) for u in chunk_uids)
+            cand_chunk_eager = (
+                pl.read_parquet(str(merged_path))
+                .filter(pl.col("uid").cast(pl.Int64).is_in(list(chunk_uid_set)))
+            )
+            cand_chunk_lf = cand_chunk_eager.lazy()
+            features_lf = _build_features_lf_for_chunk(
+                cand_chunk_lf,
+                listens_path=listens_path,
+                likes_path=likes_path,
+                dislikes_path=dislikes_path,
+                unlikes_path=unlikes_path,
+                undislikes_path=undislikes_path,
+                artist_map_path=artist_map_path,
+                album_map_path=album_map_path,
+                cutoff_ts=cutoff_ts,
+                embeddings_path=embeddings_path,
+                label_gt_path=label_gt_path,
+            )
+            features = features_lf.collect()
+            n_cols_seen = len(features.columns)
+            chunk_path = tmp_dir / f"chunk_{i:04d}.parquet"
+            features.write_parquet(str(chunk_path), compression="zstd")
+            log.info(
+                "features_phase: chunk %d/%d — %d rows × %d cols → %s",
+                i, len(chunks), len(features), n_cols_seen, chunk_path,
+            )
+            chunk_paths.append(chunk_path)
+            del features, features_lf, cand_chunk_lf
+            gc.collect()
+
+        log.info(
+            "features_phase: concatenating %d chunks → %s",
+            len(chunk_paths), output_path,
+        )
+        # Streaming concat — Polars reads each chunk and writes without a
+        # full materialisation. Schema is identical across chunks because
+        # each chunk runs the same add_features pipeline.
+        (
+            pl.scan_parquet([str(p) for p in chunk_paths])
+            .sink_parquet(str(output_path), compression="zstd")
+        )
+        # Sanity: count rows from the final parquet without loading it.
+        n_rows = (
+            pl.scan_parquet(str(output_path)).select(pl.len()).collect().item()
+        )
+        log.info(
+            "features_phase: final %d rows × %d cols → %s",
+            n_rows, n_cols_seen, output_path,
+        )
+    finally:
+        # Clean up partial chunks regardless of success / failure to avoid
+        # leaving stale files around between runs.
+        for p in chunk_paths:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
     return output_path
 
 
