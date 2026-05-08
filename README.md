@@ -128,3 +128,44 @@ pytest tests/ -v
 See [CLAUDE.md](CLAUDE.md) for code style, hygiene rules
 (`temporal_split` invariants, CG cache semantics), and coding conventions
 followed by both human contributors and AI agents.
+
+
+# Optuna joint configs
+1. Сгенерить 5 конфигов из топа joint_v2
+```bash
+python scripts/apply_optuna_top_k.py \
+  --study-name joint_v2 \
+  --storage sqlite:///${HOME}/dc-remote/artifacts/optuna/joint_v2.db \
+  --base configs/ranker.yaml \
+  --out-prefix configs/ranker_v2_top \
+  --top-k 5
+```
+
+2. Прогон train+submit для каждого
+```bash
+for i in 1 2 3 4 5; do \
+  set -o pipefail && \
+  python -u scripts/train_ranker.py \
+    --config-name=ranker_v2_top$i \
+    data=500m run_id=v2_top$i \
+    2>&1 | tee /tmp/v2_top${i}_train.log && \
+  python -u scripts/submit_ranker.py \
+    --config-name=ranker_v2_top$i \
+    data=500m run_id=v2_top$i \
+    +submission_dir=submissions \
+    +submission_name=v2_top$i \
+    2>&1 | tee /tmp/v2_top${i}_submit_v2.log; \
+done
+```
+3. Или прогон только submit обученных ранкеров
+```bash
+for i in 1 2 3 4 5; do \
+  set -o pipefail && \
+  python -u scripts/submit_ranker.py \
+    --config-name=ranker_v2_top$i \
+    data=500m run_id=v2_top$i \
+    +submission_dir=submissions \
+    +submission_name=v2_top$i \
+    2>&1 | tee /tmp/v2_top${i}_submit_v2.log; \
+done
+```
