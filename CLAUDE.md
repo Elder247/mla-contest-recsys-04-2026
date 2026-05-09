@@ -33,11 +33,13 @@ uid,item_ids
 └────────┬─────────────────┘
          ▼
 ┌─ LightGBM 1-stage ───────┐  fixed lambdarank, fit ONCE
-│  score → top-n_ranker    │  optuna: n_ranker ∈ [400, 1500] step 50
+│  score → top-N per uid   │  train: n_ranker_train=1023 (fixed)
+│                          │  eval:  n_ranker_eval ∈ [1000,2000] step 50 (optuna)
 └────────┬─────────────────┘
-         ▼ <= n_ranker × n_users
+         ▼ <= n_ranker_eval × n_users
 ┌─ CatBoost 2-stage ───────┐  YetiRank GPU, 1023-cap по RRF
-│  score → top-100         │  optuna: iter/depth/lr/l2_leaf_reg
+│  score → top-100         │  optuna: iter/depth/lr/l2_leaf_reg/
+│                          │          bagging_temperature/random_strength
 └────────┬─────────────────┘
          ▼ submission CSV
 ```
@@ -119,31 +121,44 @@ data/               (gitignored) 50m/  500m/  5b/  embeddings.parquet
 ```
 
 ## Команды (стандартный pipeline в порядке выполнения)
+
+Допущения:
+- `artifacts_root` = `/home/astrofimuk/dc-remote/artifacts` (см. `configs/ranker.yaml`). Под Linux/macOS sqlite-URI выходит вида `sqlite:////home/astrofimuk/dc-remote/artifacts/optuna/joint_v4.db` (4 слэша = абсолютный путь). Если у тебя другой путь — подставь его в `--storage`.
+- Все нижеследующие `n_ranker_train=1023` и `n_ranker_eval=1500` — defaults из `configs/ranker.yaml`; явно прописывать НЕ нужно. `optuna joint_v4` тюнит только `n_ranker_eval`.
+
 ```bash
 # 0) Tests (быстро, локально)
 pytest tests/ -v
 
-# 1) Прогрев features + LGBM (ОДИН раз для данного run_id; даёт _train/_eval/_lgbm parquets)
+# 1) Прогрев features + LGBM (ОДИН раз; пишет _train/_eval/_lgbm parquets + lgbm_{run_id}.pkl)
+#    Параметры из ranker.yaml: n_cand=800, n_ranker_train=1023, n_ranker_eval=1500.
+#    Этот же run_id используется как base для Optuna joint_v2 ниже.
 python -u scripts/train_ranker.py data=500m run_id=v4_features \
-  feature_chunk_size=5000 enable_embed_features=true n_ranker=1500 \
+  feature_chunk_size=5000 enable_embed_features=true \
   2>&1 | tee /tmp/v4_features.log
 
-# 2) Optuna joint (cascade на cached features из шага 1)
+# 2) Optuna joint (cascade на cached features + LGBM scores из шага 1)
+#    n_ranker_eval тюнится в [1000, 2000] step 50; defaults из tune.yaml/ranker.yaml.
 python -u scripts/tune.py phase=joint_v2 data=500m run_id=v4_features \
   n_max_per_cg=800 n_cand_min=0 \
   cg_names_list='[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]' \
   study_name=joint_v4 n_trials=80 2>&1 | tee /tmp/joint_v4.log
 
-# 3) Top-K config gen
+# 3) Top-K config gen — ВАЖНО: --pool-size 800 чтобы n_cand в сгенерённых yaml-ах
+#    совпадал с тем, на чём тюнили (defaults: 500 → лучше явно).
 python scripts/apply_optuna_top_k.py --study-name joint_v4 \
-  --storage sqlite:///${HOME}/dc-remote/artifacts/optuna/joint_v4.db \
-  --base configs/ranker.yaml --out-prefix configs/ranker_v4_top --top-k 5
+  --storage sqlite:////home/astrofimuk/dc-remote/artifacts/optuna/joint_v4.db \
+  --base configs/ranker.yaml --out-prefix configs/ranker_v4_top --top-k 5 \
+  --pool-size 800
 
-# 4) Train + submit одного конфига (повторить для топ-5)
+# 4) Train + submit одного конфига (повторить для топ-5).
+#    submission_name=v4_top1 → файл будет sub_v4_top1_v4_top1.csv (без — был бы sub_v4_top1_ranker.csv).
 python -u scripts/train_ranker.py --config-name=ranker_v4_top1 \
-  data=500m run_id=v4_top1 feature_chunk_size=5000 2>&1 | tee /tmp/v4_top1_train.log
+  data=500m run_id=v4_top1 feature_chunk_size=5000 \
+  2>&1 | tee /tmp/v4_top1_train.log
 python -u scripts/submit_ranker.py --config-name=ranker_v4_top1 \
-  data=500m run_id=v4_top1 2>&1 | tee /tmp/v4_top1_submit.log
+  data=500m run_id=v4_top1 submission_name=v4_top1 \
+  2>&1 | tee /tmp/v4_top1_submit.log
 
 # 5) Validate + inspect
 python scripts/validate_submission.py submissions/sub_v4_top1_v4_top1.csv
@@ -153,37 +168,39 @@ python scripts/inspect_run.py v4_top1
 ### Multi-seed averaging (страховка для финального сабмита)
 Готовая пара скриптов: [scripts/train_ranker_multiseed.py](scripts/train_ranker_multiseed.py) + [scripts/submit_ranker_multiseed.py](scripts/submit_ranker_multiseed.py). Они **переиспользуют** уже посчитанные features parquets, LGBM pickle и кэш LGBM-скоров от обычного `train_ranker.py` — новой feature-генерации **не происходит**. CatBoost обучается N раз с разными `random_state`, scores усредняются по seeds, top-100 берётся из mean-blend.
 
-Стандартный сценарий — поверх лучшего optuna-trial'а (например `ranker_v4_top1`):
+Стандартный сценарий — поверх лучшего optuna-trial'а (`ranker_v4_top1`). Шаги 0-3 ниже идут **после** train_ranker для `v4_top1` (т.е. шаг 4 в основном pipeline уже выполнен — есть `lgbm_v4_top1.pkl` + features-кэш).
 
 ```bash
-# 1) Обычный train_ranker.py для топ-1 — пишет features, LGBM pickle, LGBM scores, ranker.pkl
-python -u scripts/train_ranker.py --config-name=ranker_v4_top1 \
-  data=500m run_id=v4_top1 feature_chunk_size=5000 \
-  2>&1 | tee /tmp/v4_top1_train.log
-
-# 2) Multi-seed: тот же config, новый run_id, +base_run_id указывает откуда брать кэши
+# 1) Multi-seed train: тот же config-name, новый run_id, +base_run_id берёт кэши из v4_top1.
+#    Cascade применяется внутри: train top-1023, eval top-n_ranker_eval (из ranker_v4_top1.yaml).
 python -u scripts/train_ranker_multiseed.py --config-name=ranker_v4_top1 \
   data=500m run_id=v4_top1_ms \
   +base_run_id=v4_top1 \
   +seed_list=[42,43,44,45,46] \
   2>&1 | tee /tmp/v4_top1_ms_train.log
 
-# 3) Submit с blend-усреднением. base_run_id указывает откуда брать LGBM stage-1
+# 2) Submit с blend-усреднением (mean(ranker_score) по seeds, потом top-100 per uid).
+#    submission_name перезаписывается на v4_top1_ms (был "ranker" из apply_optuna_top_k).
 python -u scripts/submit_ranker_multiseed.py --config-name=ranker_v4_top1 \
   data=500m run_id=v4_top1_ms \
   +base_run_id=v4_top1 \
   +seed_list=[42,43,44,45,46] \
-  +submission_name=v4_top1_ms \
+  submission_name=v4_top1_ms \
   2>&1 | tee /tmp/v4_top1_ms_submit.log
 
-# 4) Validate
+# 3) Validate
 python scripts/validate_submission.py submissions/sub_v4_top1_ms_v4_top1_ms.csv
 ```
 
+Что и куда пишется:
+- `artifacts/ranker_v4_top1_ms_seed{S}.pkl` — N catboost'ов, по одному на seed.
+- `artifacts/results.csv` — строки `model="ranker_multiseed_5seeds[...]"` для val/test blended recall.
+- `submissions/sub_v4_top1_ms_v4_top1_ms.csv` — итоговый CSV.
+
 Замечания:
 - `seed_list` имеет смысл из 3-7 значений; больше — diminishing returns. 5 seeds — sweet spot.
-- Каскад идентичный обычному пайплайну: `n_ranker_train=1023` для tying split, `n_ranker_eval` (default 1500, или из топ-конфига) для inference.
-- LGBM **не переобучается** (он один на base_run_id). Cascade применяется до per-seed CatBoost fit — все seeds видят одинаковый отфильтрованный пул.
+- Каскад идентичный обычному пайплайну: `n_ranker_train=1023` для tying split, `n_ranker_eval` (берётся из `ranker_v4_top1.yaml` — т.е. оптимум из Optuna) для inference.
+- LGBM **не переобучается** (один на `base_run_id=v4_top1`). Cascade применяется до per-seed CatBoost fit — все seeds видят одинаковый отфильтрованный пул.
 - Ранее multi-seed давал +0.5-1.5 на public LB поверх top-1 single-seed. После добавления каскада ожидаемый эффект тот же.
 
 ## Запуск долгих команд
