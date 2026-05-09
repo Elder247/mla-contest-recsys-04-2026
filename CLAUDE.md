@@ -107,6 +107,7 @@ src/
                     validate_submission.py
   training/         cg_cache.py, tune.py        # tune_ranker_and_n_cand_v2 + cascade variant
 scripts/            train_ranker.py, submit_ranker.py, tune.py
+                    refit_ranker.py             # quick re-entry: skip CG/cand/feat phases
                     train.py, evaluate.py, make_submission.py, fit_cg_full.py
                     apply_optuna_top_k.py       # writes ranker_*_top{N}.yaml
                     blend_submissions.py        # RRF blend CSVs
@@ -164,6 +165,23 @@ python -u scripts/submit_ranker.py --config-name=ranker_v4_top1 \
 python scripts/validate_submission.py submissions/sub_v4_top1_v4_top1.csv
 python scripts/inspect_run.py v4_top1
 ```
+
+### Быстрый перезапуск без пересчёта фич — `scripts/refit_ranker.py`
+Когда нужно перетренировать только LGBM + CatBoost (например — починили баг в LGBM hyperparams и не хотим заново гонять multi-hour features build), используй [scripts/refit_ranker.py](scripts/refit_ranker.py). Он читает уже готовые `{features_dir}/{run_id}_{train,eval}.parquet` + `{gt_dir}/{run_id}/gt_*.parquet` и проходит только phase 5-7.
+
+```bash
+# Базовый конфиг (например, для warmup-run после фикса LGBM)
+python -u scripts/refit_ranker.py data=500m run_id=v4_features \
+  2>&1 | tee /tmp/refit_v4_features.log
+
+# Поверх top-K overlay (используются его CatBoost params; features-кэш
+# должен соответствовать — тот же n_cand, тот же набор CG)
+python -u scripts/refit_ranker.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1 \
+  2>&1 | tee /tmp/refit_v4_top1.log
+```
+
+Что перезаписывается: `lgbm_{run_id}.pkl`, `{run_id}_{train,eval}_lgbm.parquet`, `ranker_{run_id}.pkl`, добавляется строка в `results.csv` (model тэгирован как `ranker_refit[...]` для отличия). После refit можно сразу запускать `submit_ranker.py` / `submit_ranker_multiseed.py` — они подхватят свежие пиклы.
 
 ### Multi-seed averaging (страховка для финального сабмита)
 Готовая пара скриптов: [scripts/train_ranker_multiseed.py](scripts/train_ranker_multiseed.py) + [scripts/submit_ranker_multiseed.py](scripts/submit_ranker_multiseed.py). Они **переиспользуют** уже посчитанные features parquets, LGBM pickle и кэш LGBM-скоров от обычного `train_ranker.py` — новой feature-генерации **не происходит**. CatBoost обучается N раз с разными `random_state`, scores усредняются по seeds, top-100 берётся из mean-blend.

@@ -54,6 +54,12 @@ log = logging.getLogger(__name__)
 _DEFAULT_PARAMS = dict(
     objective="lambdarank",
     metric="ndcg",
+    # Evaluate NDCG at the actual cascade boundary (n_ranker_eval ≈ 1500)
+    # rather than the LightGBM default {1,2,3,4,5}. Tiny-K NDCG saturates
+    # within 1-2 trees on a pool with 9 strong CG-rank features → causes
+    # spurious early-stopping at iter=1. NDCG@100 matches the contest
+    # metric and gives a smooth, monotonic improvement signal.
+    eval_at=[100],
     num_leaves=127,
     learning_rate=0.03,
     n_estimators=3000,
@@ -70,20 +76,30 @@ _DEFAULT_PARAMS = dict(
 )
 _SKIP_COLS = {"uid", "item_id", "label"}
 DEFAULT_SCORE_CHUNK = 500_000
-DEFAULT_NEGATIVE_RATIO = 10
+DEFAULT_NEGATIVE_RATIO = None
+# Early-stopping patience at the cascade boundary. 200 is a safe default
+# given num_leaves=127 + lr=0.03 — typical best_iter on 500m sits in the
+# 600-1200 range, so 200 patience prevents premature stops on noise.
+DEFAULT_EARLY_STOPPING_ROUNDS = 200
 
 
 class LightGBMRanker:
     """Thin wrapper around :class:`lightgbm.LGBMRanker` for the cascade pipeline.
 
     Parameters:
-        negative_ratio: keep ``len(positives) * ratio`` random negatives
-            during ``fit``; ``None`` disables subsampling. Both train and val
-            pools are subsampled (val also benefits from speedup; ranking
-            metric is per-group so the relative ordering is preserved).
+        negative_ratio: keep ``len(positives) * ratio`` random negatives in
+            the **train** pool during ``fit``; ``None`` disables subsampling.
+            Validation is **never** subsampled — early-stopping needs a
+            distribution that matches deployment (cascade pool of ~800
+            candidates per uid). Subsampling val to 10:1 collapses NDCG@K
+            to a near-constant after the first tree, which historically
+            caused ``best_iter=1`` ES failures.
         subsample_seed: deterministic seed for the polars ``sample(seed=)``
             calls so different runs of the same fit produce the same
             subsampled pool.
+        early_stopping_rounds: ES patience on the validation NDCG@100. Pass
+            ``None`` to disable ES entirely (model trains for the full
+            ``n_estimators``).
         **overrides: forwarded into the underlying ``lgb.LGBMRanker`` ctor.
     """
 
@@ -92,11 +108,13 @@ class LightGBMRanker:
         *,
         negative_ratio: int | float | None = DEFAULT_NEGATIVE_RATIO,
         subsample_seed: int = 42,
+        early_stopping_rounds: int | None = DEFAULT_EARLY_STOPPING_ROUNDS,
         **overrides,
     ) -> None:
         self.params = {**_DEFAULT_PARAMS, **overrides}
         self.negative_ratio = negative_ratio
         self.subsample_seed = subsample_seed
+        self.early_stopping_rounds = early_stopping_rounds
         self._model: lgb.LGBMRanker | None = None
         self._feature_cols: list[str] = []
 
@@ -145,7 +163,9 @@ class LightGBMRanker:
 
         eval_kwargs: dict = {}
         if df_val is not None:
-            df_val = self._maybe_subsample(df_val.sort("uid"), kind="val")
+            # Critical: do NOT subsample val. ES on NDCG@100 needs the full
+            # per-uid candidate pool to produce a meaningful learning curve.
+            df_val = df_val.sort("uid")
             groups_val = (
                 df_val.group_by("uid", maintain_order=True)
                 .agg(pl.len())["len"]
@@ -153,10 +173,21 @@ class LightGBMRanker:
             )
             X_val = df_val[self._feature_cols].to_pandas()
             y_val = df_val["label"].to_pandas()
+            callbacks = []
+            if self.early_stopping_rounds is not None:
+                callbacks.append(
+                    lgb.early_stopping(
+                        stopping_rounds=int(self.early_stopping_rounds),
+                        verbose=False,
+                    )
+                )
+            # Light progress logging — every 50 trees write one line so the
+            # user can track convergence in real-time without flooding logs.
+            callbacks.append(lgb.log_evaluation(period=50))
             eval_kwargs = dict(
                 eval_set=[(X_val, y_val)],
                 eval_group=[groups_val],
-                callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+                callbacks=callbacks,
             )
 
         self._model = lgb.LGBMRanker(**self.params)
