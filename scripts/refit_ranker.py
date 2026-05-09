@@ -209,6 +209,17 @@ def main(cfg: DictConfig) -> None:
         })
     log.info("results appended to %s", results_path)
 
+    # ── 7. Optional feature importance ───────────────────────────────────────
+    if cfg.get("compute_feature_importance", True):
+        try:
+            fi = ranker.feature_importance(prettified=True)
+            fi_path = Path(cfg.output_dir) / f"feature_importance_{run_id}.csv"
+            fi.to_csv(fi_path, index=False)
+            log.info("feature importance saved to %s", fi_path)
+            log.info("top-10 features:\n%s", fi.head(10).to_string(index=False))
+        except Exception as e:
+            log.warning("feature_importance failed: %s", e)
+
     log.info(
         "DONE (refit). run_id=%s val=%.2f test=%.2f. "
         "Run submit_ranker.py to generate the submission CSV.",
