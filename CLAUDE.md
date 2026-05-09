@@ -61,7 +61,9 @@ uid,item_ids
 **Никогда не убирать esasrec из `cg_names_list`** — он в топ-10 importance.
 
 ### Two-stage ranker
-- **LightGBM** (`src/models/lightgbm_ranker.py`) — lambdarank loss, CPU. Фиксированные гиперпараметры в коде с агрессивной регуляризацией (subsample + lambdarank_truncation_level=200). Обучается один раз с **negative subsampling 10:1** (≈10× быстрее, без потерь recall). Скоры кэшируются (`{run_id}_{train,eval}_lgbm.parquet`). Первая стадия фильтрации:
+- **LightGBM** (`src/models/lightgbm_ranker.py`) — lambdarank loss, CPU. Фиксированные гиперпараметры в коде с агрессивной регуляризацией (subsample + lambdarank_truncation_level=200). Опционально **negative subsampling** (`negative_ratio`, по умолчанию выключен — см. класс). Скоры кэшируются (`{run_id}_{train,eval}_lgbm.parquet`).
+  - **OOF (group K-fold по `uid`)** — `lgbm_oof_folds` в `configs/ranker.yaml` (default **5**). Для labeled-строк считается leak-free `lgbm_score`: модель фолда не видела этих юзеров в train. Затем один **финальный** fit на 80/20 (`seed`) — в pickle попадает он; им же скорится только eval/submit пул. `lgbm_oof_folds=0` или `1` → старый режим (один fit + `score(labeled_full)` — **leak** в CatBoost).
+  Первая стадия фильтрации:
   - **`n_ranker_train=1023` (фиксировано)** — равно GPU YetiRank cap внутри `RankerModel.fit()`. Любое большее значение вырезается RRF-эвристикой при fit, что игнорирует LGBM-сигнал внизу пула.
   - **`n_ranker_eval` (тюнится в [1000, 2000])** — для inference важен recall headroom; больше кандидатов = больше шансов на positive в top-100 после CatBoost.
 - Обе колонки **`lgbm_score` (Float32) + `lgbm_rank` (Int32)** идут как фичи в CatBoost — rank инвариантен к scale.
@@ -73,7 +75,7 @@ uid,item_ids
 - `n_ranker_eval` ∈ [1000, 2000] step 50. **`n_ranker_train` зафиксирован 1023** (== GPU YetiRank cap, см. ниже).
 - CatBoost: `iterations` ∈ [1500, 4000] step 250, `depth` ∈ [4, 8], `learning_rate` ∈ [0.02, 0.15] log, `l2_leaf_reg` ∈ [1, 20] log, **`bagging_temperature` ∈ [0.0, 3.0]**, **`random_strength` ∈ [0.5, 5.0] log**.
 - Objective: `0.5 × (recall_val + recall_test)`, multivariate TPE, `n_startup_trials=20`.
-- LightGBM hyperparams **зафиксированы** в коде (см. `src/models/lightgbm_ranker.py` docstring) — `lambdarank_truncation_level=200`, `feature_fraction=0.8 / bagging_fraction=0.8 / freq=1`, lr=0.03, `n_estimators=3000`, `negative_ratio=10` (subsample при fit).
+- LightGBM hyperparams **зафиксированы** в коде (см. `src/models/lightgbm_ranker.py`) — `lambdarank_truncation_level=200`, `feature_fraction=0.8 / bagging_fraction=0.8 / freq=1`, lr=0.03, `n_estimators=3000`, опционально `negative_ratio` для ускорения fit; **OOF** по `lgbm_oof_folds` (default 5).
 
 ## Данные (Yambda)
 Размеры: `50m` / `500m` / `5b`. **Разрабатывать на 50m, прогоны на 500m.**
@@ -267,7 +269,7 @@ CatBoost Pool принимает только pandas/numpy → `.collect()` ро
 
 ## Memory hygiene на 500m
 - `feature_chunk_size: 5000` — chunked features build, иначе 120 GB OOM. `build_embed_features` рано дропает eager dataframes. LightGBM на ~14M × 85 фич: ~10-15 GB peak, predict — chunked.
-- LGBM `negative_ratio=10` (default) — fit-стадия использует ~1/10 размер тренировочного пула (только positives + 10× sample). На 500m это разница между ~3 минутами fit и ~30 минутами; для cache build / итераций тюнинга критично.
+- LGBM `negative_ratio` (если задать, напр. 10) — fit на subsample негативов; по умолчанию в коде выключено (`None`). На 500m включение даёт ~10× быстрее fit при почти том же recall.
 
 ## Внешние референсы
 https://github.com/antklen/recsys_challenge_2025 · NVIDIA 4-stage recommender blueprint (Merlin)

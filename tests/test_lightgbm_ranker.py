@@ -98,6 +98,20 @@ def test_negative_subsampling_keeps_all_positives(tiny_labeled: pl.DataFrame) ->
     assert int((sub["label"] != 1).sum()) <= 2 * n_pos
 
 
+def test_fit_oof_returns_one_score_per_row(tiny_labeled: pl.DataFrame) -> None:
+    """Group K-fold OOF produces non-leaking scores covering every labeled row."""
+    ranker = LightGBMRanker(
+        n_estimators=15,
+        num_leaves=8,
+        min_child_samples=2,
+        early_stopping_rounds=50,
+    )
+    oof = ranker.fit_oof(tiny_labeled, n_folds=3, seed=42)
+    assert oof.columns == ["uid", "item_id", "lgbm_score"]
+    assert len(oof) == len(tiny_labeled)
+    assert oof["lgbm_score"].null_count() == 0
+
+
 def test_negative_subsampling_disabled_when_none() -> None:
     ranker = LightGBMRanker(negative_ratio=None)
     df = pl.DataFrame({

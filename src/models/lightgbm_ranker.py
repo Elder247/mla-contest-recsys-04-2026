@@ -40,6 +40,14 @@ API mirrors :class:`src.models.catboost_ranker.RankerModel`:
 The score column is ``lgbm_score``; the cascade in ``train_ranker.py``
 also derives a per-user dense ``lgbm_rank`` and surfaces both columns
 to the downstream CatBoost ranker.
+
+Out-of-fold (OOF) scoring
+-------------------------
+Scoring ``labeled_full`` with an LGBM trained on a subset that includes
+the same rows leaks labels into ``lgbm_score`` (CatBoost then overfits).
+Use :meth:`fit_oof` to produce leak-free ``lgbm_score`` on labeled rows,
+then call :meth:`fit` once on an 80/20 split for the pickle used at
+submit-time (eval pool scoring).
 """
 from __future__ import annotations
 
@@ -48,6 +56,7 @@ import logging
 import lightgbm as lgb
 import numpy as np
 import polars as pl
+from sklearn.model_selection import GroupKFold
 
 log = logging.getLogger(__name__)
 
@@ -119,13 +128,79 @@ class LightGBMRanker:
         # a separate instance attr and forward only in ``.fit()``.
         if "eval_at" in overrides:
             eval_at = overrides.pop("eval_at")
-        self.params = {**_DEFAULT_PARAMS, **overrides}
+        self._user_model_overrides = dict(overrides)
+        self.params = {**_DEFAULT_PARAMS, **self._user_model_overrides}
         self.negative_ratio = negative_ratio
         self.subsample_seed = subsample_seed
         self.early_stopping_rounds = early_stopping_rounds
         self.eval_at = list(eval_at)
         self._model: lgb.LGBMRanker | None = None
         self._feature_cols: list[str] = []
+
+    def _clone_like(self, *, subsample_seed: int | None = None) -> LightGBMRanker:
+        """Fresh ranker with identical ctor kwargs (for OOF folds)."""
+        return LightGBMRanker(
+            negative_ratio=self.negative_ratio,
+            subsample_seed=(
+                self.subsample_seed if subsample_seed is None else subsample_seed
+            ),
+            early_stopping_rounds=self.early_stopping_rounds,
+            eval_at=tuple(self.eval_at),
+            **self._user_model_overrides,
+        )
+
+    def fit_oof(
+        self,
+        df_labeled: pl.DataFrame,
+        *,
+        n_folds: int,
+        seed: int = 42,
+    ) -> pl.DataFrame:
+        """Out-of-fold ``lgbm_score`` for every labeled row (group-wise by ``uid``).
+
+        For each fold, trains on all rows whose ``uid`` is in the train folds,
+        early-stops on the holdout fold, then scores **only** the holdout rows.
+        Concatenated result has one row per input row with columns
+        ``uid``, ``item_id``, ``lgbm_score`` — safe to join to ``df_labeled``
+        for cascade + CatBoost without label leakage into stage-1 scores.
+
+        Does **not** mutate ``self._model``; call :meth:`fit` afterward for the
+        production pickle used to score the eval/submit pool.
+
+        Args:
+            df_labeled: labeled candidate×user rows (must include ``uid``,
+                ``item_id``, ``label``, features).
+            n_folds: ``>= 2``. Uses :class:`sklearn.model_selection.GroupKFold`
+                so all rows of a user stay in the same fold split.
+            seed: forwarded to ``GroupKFold.shuffle`` when sklearn supports it;
+                subsample seeds per fold use ``self.subsample_seed + fold * 10001``.
+        """
+        if n_folds < 2:
+            raise ValueError("fit_oof: n_folds must be >= 2")
+        df = df_labeled.sort("uid")
+        uids = df["uid"].to_numpy()
+        n = len(df)
+        gkf = GroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        parts: list[pl.DataFrame] = []
+        for fold, (train_idx, val_idx) in enumerate(
+            gkf.split(np.zeros(n), groups=uids),
+        ):
+            df_tr = df[train_idx]
+            df_va = df[val_idx]
+            m = self._clone_like(subsample_seed=self.subsample_seed + fold * 10_001)
+            log.info(
+                "LightGBMRanker.fit_oof: fold %d/%d  train_rows=%d  val_rows=%d",
+                fold + 1, n_folds, len(df_tr), len(df_va),
+            )
+            m.fit(df_tr, df_va)
+            parts.append(m.score(df_va))
+        out = pl.concat(parts)
+        if len(out) != n:
+            raise RuntimeError(
+                f"fit_oof: expected {n} scored rows, got {len(out)}",
+            )
+        log.info("LightGBMRanker.fit_oof: done — %d rows OOF", len(out))
+        return out
 
     def _maybe_subsample(self, df: pl.DataFrame, kind: str) -> pl.DataFrame:
         """Return ``df`` with negatives downsampled to ``negative_ratio:1``.

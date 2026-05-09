@@ -34,6 +34,10 @@ Outputs:
 
 The cascade cuts (``n_ranker_train`` / ``n_ranker_eval``) come from the
 loaded config — same defaults / overlays as ``train_ranker.py``.
+
+Stage-1 aligned with ``train_ranker.py``: when ``lgbm_oof_folds >= 2``,
+labeled rows get out-of-fold ``lgbm_score``; the saved pickle is the
+final 80/20 fit used only for eval-feature scoring.
 """
 from __future__ import annotations
 
@@ -119,11 +123,39 @@ def main(cfg: DictConfig) -> None:
     )
 
     df_train_lgbm, df_val_lgbm = _split_for_ranker(labeled_full, seed=cfg.seed)
-    log.info("LGBM train=%d  val=%d", len(df_train_lgbm), len(df_val_lgbm))
+    log.info(
+        "LGBM ref split: train=%d  val=%d",
+        len(df_train_lgbm), len(df_val_lgbm),
+    )
 
     lgbm = LightGBMRanker()
+    n_oof = int(cfg.get("lgbm_oof_folds", 5))
+
+    if n_oof >= 2:
+        log.info(
+            "LGBM OOF: n_folds=%d — leak-free lgbm_score on labeled rows",
+            n_oof,
+        )
+        oof_scores = lgbm.fit_oof(labeled_full, n_folds=n_oof, seed=cfg.seed)
+        labeled_lgbm = (
+            labeled_full
+            .select(["uid", "item_id"])
+            .join(oof_scores, on=["uid", "item_id"], how="inner")
+        )
+        if len(labeled_lgbm) != len(labeled_full):
+            raise RuntimeError(
+                "OOF join row mismatch — duplicate (uid, item_id) in labeled?",
+            )
+    else:
+        log.info(
+            "LGBM OOF disabled (lgbm_oof_folds=%s): single-model labeled scores",
+            n_oof,
+        )
+
     lgbm.fit(df_train_lgbm, df_val_lgbm)
-    del df_train_lgbm, df_val_lgbm
+
+    if n_oof < 2:
+        labeled_lgbm = lgbm.score(labeled_full)
 
     ranker_dir = Path(cfg.ranker_dir)
     ranker_dir.mkdir(parents=True, exist_ok=True)
@@ -132,8 +164,7 @@ def main(cfg: DictConfig) -> None:
         pickle.dump(lgbm, f)
     log.info("LGBM saved to %s", lgbm_path)
 
-    # ── 2. Re-score labeled + eval pools, refresh score parquets ─────────────
-    labeled_lgbm = lgbm.score(labeled_full)
+    # ── 2. Re-score eval pool; labeled scores from OOF or legacy above ──────
     labeled_lgbm_path = features_dir / f"{run_id}_train_lgbm.parquet"
     labeled_lgbm.write_parquet(labeled_lgbm_path, compression="zstd")
 
