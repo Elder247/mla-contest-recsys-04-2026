@@ -135,10 +135,10 @@ followed by both human contributors and AI agents.
 ```bash
 python scripts/apply_optuna_top_k.py \
   --study-name joint_v2 \
-  --storage sqlite:///${HOME}/dc-remote/artifacts/optuna/joint_v2.db \
+  --storage sqlite:///${HOME}/dc-remote/artifacts/optuna/joint_v3.db \
   --base configs/ranker.yaml \
-  --out-prefix configs/ranker_v2_top \
-  --top-k 5
+  --out-prefix configs/ranker_v3_top \
+  --top-k 1
 ```
 
 2. Прогон train+submit для каждого
