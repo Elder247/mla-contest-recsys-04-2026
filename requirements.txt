@@ -18,6 +18,7 @@ scipy==1.15.2          # transitive of implicit (CSR matrices)
 # Models
 implicit==0.7.2        # ALS, ItemKNN
 catboost==1.2.10       # YetiRank ranker
+lightgbm==4.5.0        # Stage-1 cascade lambdarank
 torch==2.5.0           # eSASRec
 faiss-cpu==1.13.2      # AudioEmbedKNN HNSW32 (server: faiss-gpu would be faster)
 

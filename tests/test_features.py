@@ -279,11 +279,25 @@ def test_add_features_emits_pair_recency_ratio_and_embed_cols(emb_parquet):
         assert f"embed_cos_user_last_{k}" in cols
     assert "embed_cos_user_liked_mean" in cols
     assert "embed_cos_user_disliked_mean" in cols
+    # H4 cross-ratio + multi-window aggregate features
+    for col in (
+        "pair_share_user_listens",
+        "pair_share_item_pop",
+        "item_pop_acceleration",
+        "pair_recency_share_30d",
+        "user_artist_focus",
+        "embed_cos_user_last_max",
+    ):
+        assert col in cols, f"expected new feature column {col} missing"
 
     # pair_recency_ratio sanity: pair_days_since_last_listen=60, user_recency_last_listen=1
     # → 60 / (1+1) = 30
     row = out.row(0, named=True)
     assert row["pair_recency_ratio"] == pytest.approx(60.0 / 2.0, abs=1e-4)
+    # embed_cos_user_last_max equals max of the per-K cosines for this row.
+    last_k_vals = [row[f"embed_cos_user_last_{k}"] for k in (5, 20, 50, 100)]
+    if all(v is not None and not np.isnan(v) for v in last_k_vals):
+        assert row["embed_cos_user_last_max"] == pytest.approx(max(last_k_vals), abs=1e-5)
 
 
 def test_add_features_skips_embed_when_no_path():

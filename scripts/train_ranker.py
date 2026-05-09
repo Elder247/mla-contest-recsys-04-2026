@@ -50,6 +50,7 @@ from src.inference.phases import (
     write_ground_truth,
 )
 from src.models.catboost_ranker import RankerModel
+from src.models.lightgbm_ranker import LightGBMRanker
 from src.utils import setup_logging
 
 log = logging.getLogger(__name__)
@@ -99,6 +100,25 @@ def _split_for_ranker(df: pl.DataFrame, seed: int) -> tuple[pl.DataFrame, pl.Dat
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
     train_idx, val_idx = next(gss.split(np.zeros(len(df)), groups=uids))
     return df[train_idx], df[val_idx]
+
+
+def _cascade_cut(df_feat: pl.DataFrame, df_lgbm: pl.DataFrame, n: int) -> pl.DataFrame:
+    """Join LGBM scores, take top-n per uid by ``lgbm_score``, add ``lgbm_rank``.
+
+    Both ``lgbm_score`` (Float32) and ``lgbm_rank`` (Int32) are kept as
+    feature columns for the downstream CatBoost — rank is more invariant
+    to score scale across optuna trials with different LGBM check-points.
+    """
+    return (
+        df_feat
+        .join(df_lgbm, on=["uid", "item_id"], how="left")
+        .sort(["uid", "lgbm_score"], descending=[False, True])
+        .group_by("uid", maintain_order=True)
+        .head(n)
+        .with_columns(
+            pl.int_range(1, pl.len() + 1).over("uid").cast(pl.Int32).alias("lgbm_rank")
+        )
+    )
 
 
 def _append_results(path: Path, row: dict) -> None:
@@ -240,32 +260,71 @@ def main(cfg: DictConfig) -> None:
         # No label_gt_path — eval features are unlabeled; predict only.
     ], config_name=config_name)
 
-    # ── 5. In-process: load labeled train features → train ranker ────────────
+    # ── 5. In-process: load labeled train features → train LGBM ──────────────
     log.info("loading labeled train features ← %s", feats_train_path)
-    labeled = pl.read_parquet(feats_train_path)
-    pos_rate = float(labeled["label"].mean())
+    labeled_full = pl.read_parquet(feats_train_path)
+    pos_rate = float(labeled_full["label"].mean())
     log.info(
         "labeled features: %d rows × %d cols | label rate: %.4f (neg_ratio ~%d:1)",
-        len(labeled), len(labeled.columns), pos_rate,
+        len(labeled_full), len(labeled_full.columns), pos_rate,
         int(1 / pos_rate) if pos_rate > 0 else 0,
     )
 
-    df_train, df_val_ranker = _split_for_ranker(labeled, cfg.seed)
+    # ── 5a. LightGBM stage-1 fit + score caches ──────────────────────────────
+    df_train_lgbm, df_val_lgbm = _split_for_ranker(labeled_full, seed=cfg.seed)
+    log.info("LGBM train=%d  val=%d", len(df_train_lgbm), len(df_val_lgbm))
+
+    lgbm = LightGBMRanker()  # fixed defaults
+    lgbm.fit(df_train_lgbm, df_val_lgbm)
+    del df_train_lgbm, df_val_lgbm
+
+    ranker_dir = Path(cfg.ranker_dir)
+    ranker_dir.mkdir(parents=True, exist_ok=True)
+    lgbm_path = ranker_dir / f"lgbm_{run_id}.pkl"
+    with open(lgbm_path, "wb") as f:
+        pickle.dump(lgbm, f)
+    log.info("LGBM saved to %s", lgbm_path)
+
+    # Score labeled + eval pools once; cache parquets so optuna trials can
+    # reuse them without re-running LGBM predict per trial.
+    labeled_lgbm = lgbm.score(labeled_full)
+    labeled_lgbm_path = features_dir / f"{run_id}_train_lgbm.parquet"
+    labeled_lgbm.write_parquet(labeled_lgbm_path, compression="zstd")
+
+    log.info("loading eval features ← %s", feats_eval_path)
+    eval_full = pl.read_parquet(feats_eval_path)
+    log.info(
+        "eval features: %d rows × %d cols",
+        len(eval_full), len(eval_full.columns),
+    )
+    eval_lgbm = lgbm.score(eval_full)
+    eval_lgbm_path = features_dir / f"{run_id}_eval_lgbm.parquet"
+    eval_lgbm.write_parquet(eval_lgbm_path, compression="zstd")
+    log.info(
+        "LGBM scores cached: %s, %s", labeled_lgbm_path, eval_lgbm_path,
+    )
+
+    # ── 5b. Cascade cutoff: keep top-n_ranker per user, add lgbm_rank ────────
+    n_ranker = int(cfg.get("n_ranker", 1500))
+    log.info("cascade: keeping top-%d per user (LGBM stage-1)", n_ranker)
+    labeled_full = _cascade_cut(labeled_full, labeled_lgbm, n_ranker)
+    eval_full_cut = _cascade_cut(eval_full, eval_lgbm, n_ranker)
+    log.info(
+        "after cascade: labeled=%d rows, eval=%d rows",
+        len(labeled_full), len(eval_full_cut),
+    )
+    del eval_full, labeled_lgbm, eval_lgbm
+
+    # ── 5c. CatBoost stage-2 fit on cascaded labeled ─────────────────────────
+    df_train, df_val_ranker = _split_for_ranker(labeled_full, cfg.seed)
     log.info("ranker train=%d  val=%d", len(df_train), len(df_val_ranker))
-    del labeled
+    del labeled_full
 
     ranker = RankerModel(**cfg.ranker)
     ranker.fit(df_train, df_val_ranker)
     del df_train, df_val_ranker
 
-    # ── 6. Eval Recall@100 on val + test ─────────────────────────────────────
-    log.info("loading eval features ← %s", feats_eval_path)
-    feats_full = pl.read_parquet(feats_eval_path)
-    log.info(
-        "eval features: %d rows × %d cols",
-        len(feats_full), len(feats_full.columns),
-    )
-
+    # ── 6. Eval Recall@100 on val + test (using cascaded eval pool) ──────────
     gt_val = pl.read_parquet(gt_val_path)
     gt_test = pl.read_parquet(gt_test_path)
     log.info(
@@ -274,7 +333,7 @@ def main(cfg: DictConfig) -> None:
         len(gt_test), gt_test["uid"].n_unique(),
     )
 
-    preds = ranker.predict(feats_full, n=cfg.top_k)
+    preds = ranker.predict(eval_full_cut, n=cfg.top_k)
     score_val = recall_at_k(gt_val, preds, k=cfg.top_k)
     log.info("val  Recall@%d = %.2f", cfg.top_k, score_val)
     score_test = recall_at_k(gt_test, preds, k=cfg.top_k)

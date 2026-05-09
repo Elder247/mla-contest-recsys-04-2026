@@ -32,7 +32,7 @@ import logging
 from pathlib import Path
 
 import optuna
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from src.utils import setup_logging
 
@@ -89,6 +89,19 @@ def _apply_trial_to_config(cfg, trial: optuna.trial.FrozenTrial, pool_size: int)
             old = cfg.ranker[k]
             cfg.ranker[k] = trial.params[k]
             log.info("  ranker.%s: %s → %s", k, old, trial.params[k])
+
+    # Inject keys that submit_ranker.yaml needs but base ranker.yaml doesn't
+    # expose, so the generated config can be passed directly to
+    # ``submit_ranker.py --config-name=...`` without ``+submission_*`` overrides.
+    with open_dict(cfg):
+        if "submission_dir" not in cfg:
+            cfg.submission_dir = "submissions"
+        if "submission_name" not in cfg:
+            cfg.submission_name = "ranker"
+        if "n_ranker" in trial.params:
+            old = cfg.get("n_ranker")
+            cfg.n_ranker = int(trial.params["n_ranker"])
+            log.info("  n_ranker: %s → %d", old, cfg.n_ranker)
 
 
 def main() -> None:

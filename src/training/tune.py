@@ -439,6 +439,11 @@ def tune_ranker_and_n_cand_v2(
     seed: int = 42,
     show_progress_bar: bool = False,
     baseline_params: dict | None = None,
+    lgbm_scores_train: pl.DataFrame | None = None,
+    lgbm_scores_eval: pl.DataFrame | None = None,
+    n_ranker_min: int = 400,
+    n_ranker_max: int = 1500,
+    n_ranker_step: int = 50,
 ) -> optuna.Study:
     """Anti-overfit variant of :func:`tune_ranker_and_n_cand`.
 
@@ -501,6 +506,29 @@ def tune_ranker_and_n_cand_v2(
             f"got {list(eval_features_df.columns)}"
         )
 
+    cascade_enabled = (
+        lgbm_scores_train is not None and lgbm_scores_eval is not None
+    )
+    if cascade_enabled:
+        for name, df in (("train", lgbm_scores_train), ("eval", lgbm_scores_eval)):
+            missing = [c for c in ("uid", "item_id", "lgbm_score") if c not in df.columns]
+            if missing:
+                raise ValueError(
+                    f"tune_ranker_and_n_cand_v2: lgbm_scores_{name} missing {missing}"
+                )
+
+    def _cascade(df_feat: pl.DataFrame, df_lgbm: pl.DataFrame, n: int) -> pl.DataFrame:
+        return (
+            df_feat
+            .join(df_lgbm, on=["uid", "item_id"], how="left")
+            .sort(["uid", "lgbm_score"], descending=[False, True])
+            .group_by("uid", maintain_order=True)
+            .head(n)
+            .with_columns(
+                pl.int_range(1, pl.len() + 1).over("uid").cast(pl.Int32).alias("lgbm_rank")
+            )
+        )
+
     def objective(trial: optuna.Trial) -> float:
         ranker_params = ranker_space(trial)
         n_cands = {
@@ -509,6 +537,12 @@ def tune_ranker_and_n_cand_v2(
             )
             for name in cg_names
         }
+        if cascade_enabled:
+            n_ranker = trial.suggest_int(
+                "n_ranker", n_ranker_min, n_ranker_max, step=n_ranker_step,
+            )
+        else:
+            n_ranker = None
 
         # No budget penalty — RankerModel caps to 1023 rows/user on GPU.
         keep_expr = pl.lit(False)
@@ -528,6 +562,10 @@ def tune_ranker_and_n_cand_v2(
         eval_f = eval_features_df.filter(keep_expr)
         if len(labeled_f) == 0 or len(eval_f) == 0:
             return 0.0
+
+        if cascade_enabled:
+            labeled_f = _cascade(labeled_f, lgbm_scores_train, n_ranker)
+            eval_f = _cascade(eval_f, lgbm_scores_eval, n_ranker)
 
         df_tr, df_va = _split_for_ranker(labeled_f, seed=seed)
         ranker = RankerModel(

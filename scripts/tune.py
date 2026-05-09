@@ -518,6 +518,30 @@ def _phase_joint_v2(cfg: DictConfig, storage: str) -> optuna.Study:
         len(eval_features_df), len(eval_features_df.columns),
     )
 
+    # Optional cascade: load LGBM score caches written by train_ranker.py.
+    # When both files exist, the v2 tuner samples ``n_ranker`` ∈ [400, 1500]
+    # per trial and applies the cascade cut after the n_cand_keep filter.
+    lgbm_train_path = labeled_path.parent / f"{cfg.run_id}_train_lgbm.parquet"
+    lgbm_eval_path = eval_path.parent / f"{cfg.run_id}_eval_lgbm.parquet"
+    lgbm_scores_train = lgbm_scores_eval = None
+    if lgbm_train_path.exists() and lgbm_eval_path.exists():
+        log.info(
+            "loading cached LGBM scores: train=%s  eval=%s",
+            lgbm_train_path, lgbm_eval_path,
+        )
+        lgbm_scores_train = pl.read_parquet(lgbm_train_path)
+        lgbm_scores_eval = pl.read_parquet(lgbm_eval_path)
+        log.info(
+            "cascade enabled: lgbm_train=%d rows  lgbm_eval=%d rows",
+            len(lgbm_scores_train), len(lgbm_scores_eval),
+        )
+    else:
+        log.info(
+            "cascade disabled: LGBM score caches not found "
+            "(expected %s and %s).",
+            lgbm_train_path, lgbm_eval_path,
+        )
+
     gt_val, gt_test = _load_gt_val_test(cfg)
     log.info("gt_val: %d pairs / %d users", len(gt_val), gt_val["uid"].n_unique())
     log.info("gt_test: %d pairs / %d users", len(gt_test), gt_test["uid"].n_unique())
@@ -549,6 +573,11 @@ def _phase_joint_v2(cfg: DictConfig, storage: str) -> optuna.Study:
         storage=storage,
         seed=cfg.seed,
         baseline_params=baseline,
+        lgbm_scores_train=lgbm_scores_train,
+        lgbm_scores_eval=lgbm_scores_eval,
+        n_ranker_min=int(cfg.get("n_ranker_min", 400)),
+        n_ranker_max=int(cfg.get("n_ranker_max", 1500)),
+        n_ranker_step=int(cfg.get("n_ranker_step", 50)),
     )
 
 

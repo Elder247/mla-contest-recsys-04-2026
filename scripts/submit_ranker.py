@@ -26,6 +26,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from src.inference.phases import load_eval_users_from_csv
+from src.models.lightgbm_ranker import LightGBMRanker  # noqa: F401  (pickle compat)
 from src.utils import setup_logging
 
 log = logging.getLogger(__name__)
@@ -142,6 +143,15 @@ def main(cfg: DictConfig) -> None:
     _run_phase("scripts/_phases/compute_features.py", feat_overrides, config_name=config_name)
 
     # ── 4. In-process: predict + write submission CSV ────────────────────────
+    lgbm_path = Path(cfg.ranker_dir) / f"lgbm_{run_id}.pkl"
+    if not lgbm_path.exists():
+        raise FileNotFoundError(
+            f"LGBM stage-1 pickle not found: {lgbm_path}. Re-run train_ranker.py."
+        )
+    log.info("loading LGBM ← %s", lgbm_path)
+    with open(lgbm_path, "rb") as f:
+        lgbm = pickle.load(f)
+
     log.info("loading ranker ← %s", ranker_path)
     with open(ranker_path, "rb") as f:
         ranker = pickle.load(f)
@@ -153,7 +163,26 @@ def main(cfg: DictConfig) -> None:
         len(feats), len(feats.columns),
     )
 
-    preds = ranker.predict(feats, n=cfg.top_k)
+    # Cascade stage-1: LGBM scores → top-n_ranker per user, append lgbm_rank.
+    log.info("LGBM stage-1 scoring on %d submission rows", len(feats))
+    lgbm_scores = lgbm.score(feats)
+    n_ranker = int(cfg.get("n_ranker", 1500))
+    feats_cut = (
+        feats.join(lgbm_scores, on=["uid", "item_id"], how="left")
+        .sort(["uid", "lgbm_score"], descending=[False, True])
+        .group_by("uid", maintain_order=True)
+        .head(n_ranker)
+        .with_columns(
+            pl.int_range(1, pl.len() + 1).over("uid").cast(pl.Int32).alias("lgbm_rank")
+        )
+    )
+    log.info(
+        "cascade: %d → %d rows after top-%d cut",
+        len(feats), len(feats_cut), n_ranker,
+    )
+    del feats, lgbm_scores
+
+    preds = ranker.predict(feats_cut, n=cfg.top_k)
     submission = _format_submission(preds, top_k=cfg.top_k)
     log.info("submission rows: %d", len(submission))
 

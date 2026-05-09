@@ -955,9 +955,35 @@ def add_features(
                 / (pl.col("user_recency_last_listen").cast(pl.Float32) + 1.0)
             ).cast(pl.Float32).alias("pair_recency_ratio")
         )
+        # Five cross-ratio features capturing pair vs user/item normalisation,
+        # item velocity (7d/30d), pair recency share, and user-artist focus.
+        # All Float32; +1 in denominators avoids div-by-0 for cold rows.
+        .with_columns([
+            (
+                pl.col("pair_n_listens").cast(pl.Float32)
+                / (pl.col("user_n_listens").cast(pl.Float32) + 1.0)
+            ).cast(pl.Float32).alias("pair_share_user_listens"),
+            (
+                pl.col("pair_n_listens").cast(pl.Float32)
+                / (pl.col("item_pop").cast(pl.Float32) + 1.0)
+            ).cast(pl.Float32).alias("pair_share_item_pop"),
+            (
+                pl.col("item_pop_7d").cast(pl.Float32)
+                / (pl.col("item_pop_30d").cast(pl.Float32) + 1.0)
+            ).cast(pl.Float32).alias("item_pop_acceleration"),
+            (
+                pl.col("pair_n_listens_30d").cast(pl.Float32)
+                / (pl.col("pair_n_listens").cast(pl.Float32) + 1.0)
+            ).cast(pl.Float32).alias("pair_recency_share_30d"),
+            (
+                pl.col("user_artist_listens").cast(pl.Float32)
+                / (pl.col("user_n_listens").cast(pl.Float32) + 1.0)
+            ).cast(pl.Float32).alias("user_artist_focus"),
+        ])
     )
 
     if embeddings_path is not None:
+        effective_k_list = embed_last_k_list or [5, 20, 50, 100]
         embed_feats = build_embed_features(
             candidates_lf, listens_lf, likes_lf, unlikes_lf,
             dislikes_lf, undislikes_lf,
@@ -965,6 +991,15 @@ def add_features(
             last_k_list=embed_last_k_list,  # None → default [5, 20, 50, 100]
         )
         enriched_cands = enriched_cands.join(embed_feats, on=["uid", "item_id"], how="left")
+        # Aggregate window cosines: max across windows captures the best-aligned
+        # window for each pair, a robust alternative to selecting K by hand.
+        last_k_cols = [f"embed_cos_user_last_{k}" for k in effective_k_list]
+        if last_k_cols:
+            enriched_cands = enriched_cands.with_columns(
+                pl.max_horizontal(*[pl.col(c) for c in last_k_cols])
+                .cast(pl.Float32)
+                .alias("embed_cos_user_last_max")
+            )
 
     return enriched_cands
 
