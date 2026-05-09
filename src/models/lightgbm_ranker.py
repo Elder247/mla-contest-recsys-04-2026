@@ -54,12 +54,6 @@ log = logging.getLogger(__name__)
 _DEFAULT_PARAMS = dict(
     objective="lambdarank",
     metric="ndcg",
-    # Evaluate NDCG at the actual cascade boundary (n_ranker_eval ≈ 1500)
-    # rather than the LightGBM default {1,2,3,4,5}. Tiny-K NDCG saturates
-    # within 1-2 trees on a pool with 9 strong CG-rank features → causes
-    # spurious early-stopping at iter=1. NDCG@100 matches the contest
-    # metric and gives a smooth, monotonic improvement signal.
-    eval_at=[100],
     num_leaves=127,
     learning_rate=0.03,
     n_estimators=3000,
@@ -81,6 +75,14 @@ DEFAULT_NEGATIVE_RATIO = None
 # given num_leaves=127 + lr=0.03 — typical best_iter on 500m sits in the
 # 600-1200 range, so 200 patience prevents premature stops on noise.
 DEFAULT_EARLY_STOPPING_ROUNDS = 200
+# Evaluate NDCG at the actual cascade boundary (n_ranker_eval ≈ 1500)
+# rather than the LightGBM default {1,2,3,4,5}. Tiny-K NDCG saturates
+# within 1-2 trees on a pool with 9 strong CG-rank features → causes
+# spurious early-stopping at iter=1. NDCG@100 matches the contest metric
+# and gives a smooth, monotonic improvement signal. Passed as a kwarg
+# to ``.fit()`` (NOT into params) — putting it in params triggers a
+# UserWarning from lightgbm because ``eval_at`` is also a fit-time arg.
+DEFAULT_EVAL_AT = (100,)
 
 
 class LightGBMRanker:
@@ -109,12 +111,19 @@ class LightGBMRanker:
         negative_ratio: int | float | None = DEFAULT_NEGATIVE_RATIO,
         subsample_seed: int = 42,
         early_stopping_rounds: int | None = DEFAULT_EARLY_STOPPING_ROUNDS,
+        eval_at: list[int] | tuple[int, ...] = DEFAULT_EVAL_AT,
         **overrides,
     ) -> None:
+        # ``eval_at`` is a *fit-time* lightgbm arg, not a model param —
+        # passing it through ``params`` raises a UserWarning. Keep it as
+        # a separate instance attr and forward only in ``.fit()``.
+        if "eval_at" in overrides:
+            eval_at = overrides.pop("eval_at")
         self.params = {**_DEFAULT_PARAMS, **overrides}
         self.negative_ratio = negative_ratio
         self.subsample_seed = subsample_seed
         self.early_stopping_rounds = early_stopping_rounds
+        self.eval_at = list(eval_at)
         self._model: lgb.LGBMRanker | None = None
         self._feature_cols: list[str] = []
 
@@ -187,6 +196,7 @@ class LightGBMRanker:
             eval_kwargs = dict(
                 eval_set=[(X_val, y_val)],
                 eval_group=[groups_val],
+                eval_at=self.eval_at,
                 callbacks=callbacks,
             )
 
