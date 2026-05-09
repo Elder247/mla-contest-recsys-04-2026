@@ -44,6 +44,8 @@ class RankerModel:
         random_state: int = 42,
         task_type: str = "CPU",
         devices: str | None = None,
+        bagging_temperature: float | None = None,
+        random_strength: float | None = None,
     ):
         self.iterations = iterations
         self.depth = depth
@@ -53,6 +55,12 @@ class RankerModel:
         self.random_state = random_state
         self.task_type = task_type
         self.devices = devices
+        # ``None`` -> let CatBoost use its built-in default; only forward
+        # an explicit value when the caller (Optuna or a top-K config) has
+        # actually tuned it. Keeps backward compatibility with old pickles
+        # whose params dict has neither key.
+        self.bagging_temperature = bagging_temperature
+        self.random_strength = random_strength
         self._model: CatBoostRanker | None = None
         self._feature_cols: list[str] = []
 
@@ -127,6 +135,10 @@ class RankerModel:
             nan_mode="Min",
             task_type=self.task_type,
         )
+        if self.bagging_temperature is not None:
+            params["bagging_temperature"] = float(self.bagging_temperature)
+        if self.random_strength is not None:
+            params["random_strength"] = float(self.random_strength)
         if self.task_type.upper() == "GPU":
             if self.devices is not None:
                 params["devices"] = str(self.devices)

@@ -8,14 +8,19 @@ parquet path.
 
 Usage:
     python -u scripts/submit_ranker_multiseed.py \\
-        --config-name=ranker_v2_top1 data=500m \\
-        run_id=v2_top1_ms \\
+        --config-name=ranker_v4_top1 data=500m \\
+        run_id=v4_top1_ms \\
         +seed_list=[42,43,44,45,46] \\
-        +submission_name=ranker_ms
+        +submission_name=ranker_ms \\
+        +base_run_id=v4_top1   # which LGBM stage-1 to load
 
 Pre-condition: ``train_ranker_multiseed.py`` was run with the same
 ``run_id`` and ``seed_list``, producing ``ranker_{run_id}_seed{S}.pkl``
-for every S in seed_list.
+for every S in seed_list. The LGBM stage-1 pickle is loaded from the
+``base_run_id`` (typically the originating ``train_ranker.py`` run).
+
+Cascade behaviour mirrors ``submit_ranker.py``: every seed's ranker
+scores the same LGBM-cascaded top-``n_ranker_eval`` candidates.
 
 The generated CSV is mean-blended at the score level, then top-K per uid.
 """
@@ -33,6 +38,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from src.inference.phases import load_eval_users_from_csv
+from src.models.lightgbm_ranker import LightGBMRanker  # noqa: F401  (pickle compat)
 from src.utils import setup_logging
 
 log = logging.getLogger(__name__)
@@ -79,9 +85,17 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("+seed_list must be a non-empty list of ints")
     run_id = str(cfg.run_id)
     submission_name = str(cfg.get("submission_name", "ranker_ms"))
-    log.info("submit-multiseed: run_id=%s seeds=%s", run_id, seeds)
+    # The LGBM stage-1 pickle lives under ``base_run_id`` — which is
+    # typically the originating ``train_ranker.py`` run. Falls back to
+    # ``run_id`` so callers that train+submit under the same run_id
+    # don't need to set anything extra.
+    base_run_id = str(cfg.get("base_run_id", run_id))
+    log.info(
+        "submit-multiseed: run_id=%s seeds=%s base_run_id=%s",
+        run_id, seeds, base_run_id,
+    )
 
-    # Verify all ranker pkls exist before running expensive feature phases.
+    # Verify all ranker pkls + LGBM stage-1 exist before running expensive feature phases.
     ranker_dir = Path(cfg.ranker_dir)
     ranker_paths = [ranker_dir / f"ranker_{run_id}_seed{s}.pkl" for s in seeds]
     missing = [p for p in ranker_paths if not p.exists()]
@@ -89,6 +103,13 @@ def main(cfg: DictConfig) -> None:
         raise FileNotFoundError(
             f"missing ranker pkls: {missing}. Run scripts/train_ranker_multiseed.py "
             f"with run_id={run_id} and seed_list={seeds} first."
+        )
+    lgbm_path = ranker_dir / f"lgbm_{base_run_id}.pkl"
+    if not lgbm_path.exists():
+        raise FileNotFoundError(
+            f"missing LGBM stage-1 pickle: {lgbm_path}. "
+            f"Run scripts/train_ranker.py with run_id={base_run_id} first, "
+            f"or override +base_run_id=<run with cached lgbm pickle>."
         )
 
     eval_users = load_eval_users_from_csv(cfg.data.users_csv)
@@ -154,19 +175,40 @@ def main(cfg: DictConfig) -> None:
     ]
     _run_phase("scripts/_phases/compute_features.py", feat_overrides, config_name=config_name)
 
-    # ── 4. In-process: score with each seed, blend, write CSV ────────────────
+    # ── 4. In-process: cascade with LGBM, score with each seed, blend, write CSV ──
     log.info("loading submission features ← %s", feats_path)
     feats = pl.read_parquet(feats_path)
     log.info("submission features: %d rows × %d cols", len(feats), len(feats.columns))
 
-    scored = feats.select(["uid", "item_id"])
+    log.info("loading LGBM stage-1 ← %s", lgbm_path)
+    with open(lgbm_path, "rb") as f:
+        lgbm = pickle.load(f)
+    log.info("LGBM stage-1 scoring on %d submission rows", len(feats))
+    lgbm_scores = lgbm.score(feats)
+    n_ranker_eval = int(cfg.get("n_ranker_eval", cfg.get("n_ranker", 1500)))
+    feats_cut = (
+        feats.join(lgbm_scores, on=["uid", "item_id"], how="left")
+        .sort(["uid", "lgbm_score"], descending=[False, True])
+        .group_by("uid", maintain_order=True)
+        .head(n_ranker_eval)
+        .with_columns(
+            pl.int_range(1, pl.len() + 1).over("uid").cast(pl.Int32).alias("lgbm_rank")
+        )
+    )
+    log.info(
+        "cascade: %d → %d rows after top-%d cut",
+        len(feats), len(feats_cut), n_ranker_eval,
+    )
+    del feats, lgbm_scores, lgbm
+
+    scored = feats_cut.select(["uid", "item_id"])
     score_cols: list[str] = []
     for seed, ranker_path in zip(seeds, ranker_paths):
         log.info("loading ranker ← %s", ranker_path)
         with open(ranker_path, "rb") as f:
             ranker = pickle.load(f)
         log.info("scoring with seed=%d ranker", seed)
-        s = ranker.score(feats).rename({"ranker_score": f"ranker_score_seed{seed}"})
+        s = ranker.score(feats_cut).rename({"ranker_score": f"ranker_score_seed{seed}"})
         score_cols.append(f"ranker_score_seed{seed}")
         scored = scored.join(s, on=["uid", "item_id"], how="left")
         del ranker

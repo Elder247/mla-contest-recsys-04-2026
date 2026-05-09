@@ -82,3 +82,33 @@ def test_score_empty_input(tiny_labeled: pl.DataFrame) -> None:
 def test_score_before_fit_raises(tiny_labeled: pl.DataFrame) -> None:
     with pytest.raises(RuntimeError):
         LightGBMRanker().score(tiny_labeled)
+
+
+def test_negative_subsampling_keeps_all_positives(tiny_labeled: pl.DataFrame) -> None:
+    """With ``negative_ratio=2``, target_neg = 2 x n_pos; positives must survive."""
+    ranker = LightGBMRanker(
+        negative_ratio=2,
+        n_estimators=5,
+        num_leaves=4,
+        min_child_samples=2,
+    )
+    n_pos = int((tiny_labeled["label"] == 1).sum())
+    sub = ranker._maybe_subsample(tiny_labeled.sort("uid"), kind="train")
+    assert int((sub["label"] == 1).sum()) == n_pos
+    assert int((sub["label"] != 1).sum()) <= 2 * n_pos
+
+
+def test_negative_subsampling_disabled_when_none() -> None:
+    ranker = LightGBMRanker(negative_ratio=None)
+    df = pl.DataFrame({
+        "uid": [1, 1, 1],
+        "item_id": [10, 20, 30],
+        "label": [1, 0, 0],
+        "f0": [0.1, 0.2, 0.3],
+    }).with_columns([
+        pl.col("uid").cast(pl.Int64),
+        pl.col("item_id").cast(pl.Int64),
+        pl.col("label").cast(pl.Int8),
+    ])
+    out = ranker._maybe_subsample(df, kind="train")
+    assert len(out) == len(df)

@@ -59,16 +59,19 @@ uid,item_ids
 **Никогда не убирать esasrec из `cg_names_list`** — он в топ-10 importance.
 
 ### Two-stage ranker
-- **LightGBM** (`src/models/lightgbm_ranker.py`) — lambdarank loss, CPU. Фиксированные гиперпараметры в коде. Обучается один раз, скоры кэшируются. Первая стадия фильтрации до `n_ranker` кандидатов на юзера. Обе колонки **`lgbm_score` (Float32) + `lgbm_rank` (Int32)** идут как фичи в CatBoost — rank инвариантен к scale.
-- **CatBoost** (`src/models/catboost_ranker.py`) — YetiRank GPU, 1023-cap внутри `fit()` через RRF. Финальный top-100.
+- **LightGBM** (`src/models/lightgbm_ranker.py`) — lambdarank loss, CPU. Фиксированные гиперпараметры в коде с агрессивной регуляризацией (subsample + lambdarank_truncation_level=200). Обучается один раз с **negative subsampling 10:1** (≈10× быстрее, без потерь recall). Скоры кэшируются (`{run_id}_{train,eval}_lgbm.parquet`). Первая стадия фильтрации:
+  - **`n_ranker_train=1023` (фиксировано)** — равно GPU YetiRank cap внутри `RankerModel.fit()`. Любое большее значение вырезается RRF-эвристикой при fit, что игнорирует LGBM-сигнал внизу пула.
+  - **`n_ranker_eval` (тюнится в [1000, 2000])** — для inference важен recall headroom; больше кандидатов = больше шансов на positive в top-100 после CatBoost.
+- Обе колонки **`lgbm_score` (Float32) + `lgbm_rank` (Int32)** идут как фичи в CatBoost — rank инвариантен к scale.
+- **CatBoost** (`src/models/catboost_ranker.py`) — YetiRank GPU, 1023-cap внутри `fit()` через RRF. Финальный top-100. Поддерживает дополнительные knobs `bagging_temperature`, `random_strength` (None → CatBoost default).
 
 ### Optuna (joint_v4)
-Поверхность поиска (~14 dim):
+Поверхность поиска (~16 dim):
 - 9 × `n_cand_keep_X` ∈ [0, 800] step 50.
-- `n_ranker` ∈ [400, 1500] step 50.
-- CatBoost: `iterations` ∈ [1500, 4000] step 250, `depth` ∈ [4, 8], `learning_rate` ∈ [0.02, 0.15] log, `l2_leaf_reg` ∈ [1, 20] log.
+- `n_ranker_eval` ∈ [1000, 2000] step 50. **`n_ranker_train` зафиксирован 1023** (== GPU YetiRank cap, см. ниже).
+- CatBoost: `iterations` ∈ [1500, 4000] step 250, `depth` ∈ [4, 8], `learning_rate` ∈ [0.02, 0.15] log, `l2_leaf_reg` ∈ [1, 20] log, **`bagging_temperature` ∈ [0.0, 3.0]**, **`random_strength` ∈ [0.5, 5.0] log**.
 - Objective: `0.5 × (recall_val + recall_test)`, multivariate TPE, `n_startup_trials=20`.
-- LightGBM hyperparams **зафиксированы** в коде.
+- LightGBM hyperparams **зафиксированы** в коде (см. `src/models/lightgbm_ranker.py` docstring) — `lambdarank_truncation_level=200`, `feature_fraction=0.8 / bagging_fraction=0.8 / freq=1`, lr=0.03, `n_estimators=3000`, `negative_ratio=10` (subsample при fit).
 
 ## Данные (Yambda)
 Размеры: `50m` / `500m` / `5b`. **Разрабатывать на 50m, прогоны на 500m.**
@@ -147,6 +150,42 @@ python scripts/validate_submission.py submissions/sub_v4_top1_v4_top1.csv
 python scripts/inspect_run.py v4_top1
 ```
 
+### Multi-seed averaging (страховка для финального сабмита)
+Готовая пара скриптов: [scripts/train_ranker_multiseed.py](scripts/train_ranker_multiseed.py) + [scripts/submit_ranker_multiseed.py](scripts/submit_ranker_multiseed.py). Они **переиспользуют** уже посчитанные features parquets, LGBM pickle и кэш LGBM-скоров от обычного `train_ranker.py` — новой feature-генерации **не происходит**. CatBoost обучается N раз с разными `random_state`, scores усредняются по seeds, top-100 берётся из mean-blend.
+
+Стандартный сценарий — поверх лучшего optuna-trial'а (например `ranker_v4_top1`):
+
+```bash
+# 1) Обычный train_ranker.py для топ-1 — пишет features, LGBM pickle, LGBM scores, ranker.pkl
+python -u scripts/train_ranker.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1 feature_chunk_size=5000 \
+  2>&1 | tee /tmp/v4_top1_train.log
+
+# 2) Multi-seed: тот же config, новый run_id, +base_run_id указывает откуда брать кэши
+python -u scripts/train_ranker_multiseed.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1_ms \
+  +base_run_id=v4_top1 \
+  +seed_list=[42,43,44,45,46] \
+  2>&1 | tee /tmp/v4_top1_ms_train.log
+
+# 3) Submit с blend-усреднением. base_run_id указывает откуда брать LGBM stage-1
+python -u scripts/submit_ranker_multiseed.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1_ms \
+  +base_run_id=v4_top1 \
+  +seed_list=[42,43,44,45,46] \
+  +submission_name=v4_top1_ms \
+  2>&1 | tee /tmp/v4_top1_ms_submit.log
+
+# 4) Validate
+python scripts/validate_submission.py submissions/sub_v4_top1_ms_v4_top1_ms.csv
+```
+
+Замечания:
+- `seed_list` имеет смысл из 3-7 значений; больше — diminishing returns. 5 seeds — sweet spot.
+- Каскад идентичный обычному пайплайну: `n_ranker_train=1023` для tying split, `n_ranker_eval` (default 1500, или из топ-конфига) для inference.
+- LGBM **не переобучается** (он один на base_run_id). Cascade применяется до per-seed CatBoost fit — все seeds видят одинаковый отфильтрованный пул.
+- Ранее multi-seed давал +0.5-1.5 на public LB поверх top-1 single-seed. После добавления каскада ожидаемый эффект тот же.
+
 ## Запуск долгих команд
 **Обязательно `python -u`** для unbuffered stdout (CatBoost progress в `tee /tmp/x.log` иначе появится только после завершения).
 
@@ -193,6 +232,7 @@ CatBoost Pool принимает только pandas/numpy → `.collect()` ро
 
 ## Memory hygiene на 500m
 - `feature_chunk_size: 5000` — chunked features build, иначе 120 GB OOM. `build_embed_features` рано дропает eager dataframes. LightGBM на ~14M × 85 фич: ~10-15 GB peak, predict — chunked.
+- LGBM `negative_ratio=10` (default) — fit-стадия использует ~1/10 размер тренировочного пула (только positives + 10× sample). На 500m это разница между ~3 минутами fit и ~30 минутами; для cache build / итераций тюнинга критично.
 
 ## Внешние референсы
 https://github.com/antklen/recsys_challenge_2025 · NVIDIA 4-stage recommender blueprint (Merlin)

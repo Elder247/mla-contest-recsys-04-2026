@@ -304,11 +304,20 @@ def main(cfg: DictConfig) -> None:
         "LGBM scores cached: %s, %s", labeled_lgbm_path, eval_lgbm_path,
     )
 
-    # ── 5b. Cascade cutoff: keep top-n_ranker per user, add lgbm_rank ────────
-    n_ranker = int(cfg.get("n_ranker", 1500))
-    log.info("cascade: keeping top-%d per user (LGBM stage-1)", n_ranker)
-    labeled_full = _cascade_cut(labeled_full, labeled_lgbm, n_ranker)
-    eval_full_cut = _cascade_cut(eval_full, eval_lgbm, n_ranker)
+    # ── 5b. Cascade cutoff (split train vs eval) ─────────────────────────────
+    # Train cascade: fixed at the GPU YetiRank hard limit (1023). Anything
+    # above is dropped by ``RankerModel.fit``'s RRF cap anyway, so feeding
+    # the LGBM-sorted top-1023 directly maximises useful signal.
+    # Eval cascade: tunable ``n_ranker_eval`` (default 1500) — more candidates
+    # mean more chances to surface a positive in the final top-100.
+    n_ranker_train = int(cfg.get("n_ranker_train", 1023))
+    n_ranker_eval = int(cfg.get("n_ranker_eval", 1500))
+    log.info(
+        "cascade: train top-%d / eval top-%d per user (LGBM stage-1)",
+        n_ranker_train, n_ranker_eval,
+    )
+    labeled_full = _cascade_cut(labeled_full, labeled_lgbm, n_ranker_train)
+    eval_full_cut = _cascade_cut(eval_full, eval_lgbm, n_ranker_eval)
     log.info(
         "after cascade: labeled=%d rows, eval=%d rows",
         len(labeled_full), len(eval_full_cut),

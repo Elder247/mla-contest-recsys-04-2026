@@ -38,7 +38,14 @@ from src.utils import setup_logging
 
 log = logging.getLogger(__name__)
 
-_RANKER_KEYS = ("iterations", "depth", "learning_rate", "l2_leaf_reg")
+_RANKER_KEYS = (
+    "iterations",
+    "depth",
+    "learning_rate",
+    "l2_leaf_reg",
+    "bagging_temperature",
+    "random_strength",
+)
 
 
 def _load_top_k_trials(
@@ -84,11 +91,15 @@ def _apply_trial_to_config(cfg, trial: optuna.trial.FrozenTrial, pool_size: int)
         cg["n_cand_keep"] = int(n_keep)
         log.info("  %s: n_cand=%d, n_cand_keep=%d", name, pool_size, int(n_keep))
 
-    for k in _RANKER_KEYS:
-        if k in trial.params and k in cfg.ranker:
-            old = cfg.ranker[k]
-            cfg.ranker[k] = trial.params[k]
-            log.info("  ranker.%s: %s → %s", k, old, trial.params[k])
+    # Allow Optuna to introduce new ranker hyperparams (e.g. bagging_temperature
+    # / random_strength added later) — open_dict bypasses the base config's
+    # struct mode for these injects.
+    with open_dict(cfg.ranker):
+        for k in _RANKER_KEYS:
+            if k in trial.params:
+                old = cfg.ranker.get(k)
+                cfg.ranker[k] = trial.params[k]
+                log.info("  ranker.%s: %s → %s", k, old, trial.params[k])
 
     # Inject keys that submit_ranker.yaml needs but base ranker.yaml doesn't
     # expose, so the generated config can be passed directly to
@@ -98,10 +109,18 @@ def _apply_trial_to_config(cfg, trial: optuna.trial.FrozenTrial, pool_size: int)
             cfg.submission_dir = "submissions"
         if "submission_name" not in cfg:
             cfg.submission_name = "ranker"
-        if "n_ranker" in trial.params:
-            old = cfg.get("n_ranker")
-            cfg.n_ranker = int(trial.params["n_ranker"])
-            log.info("  n_ranker: %s → %d", old, cfg.n_ranker)
+        # Cascade tuning split: n_ranker_train is fixed (1023 == GPU cap),
+        # only n_ranker_eval comes out of the trial. We accept the legacy
+        # ``n_ranker`` param name for back-compat with older studies.
+        eval_key = (
+            "n_ranker_eval" if "n_ranker_eval" in trial.params
+            else "n_ranker" if "n_ranker" in trial.params
+            else None
+        )
+        if eval_key is not None:
+            old = cfg.get("n_ranker_eval")
+            cfg.n_ranker_eval = int(trial.params[eval_key])
+            log.info("  n_ranker_eval: %s → %d", old, cfg.n_ranker_eval)
 
 
 def main() -> None:

@@ -575,9 +575,10 @@ def _phase_joint_v2(cfg: DictConfig, storage: str) -> optuna.Study:
         baseline_params=baseline,
         lgbm_scores_train=lgbm_scores_train,
         lgbm_scores_eval=lgbm_scores_eval,
-        n_ranker_min=int(cfg.get("n_ranker_min", 400)),
-        n_ranker_max=int(cfg.get("n_ranker_max", 1500)),
-        n_ranker_step=int(cfg.get("n_ranker_step", 50)),
+        n_ranker_train=int(cfg.get("n_ranker_train", 1023)),
+        n_ranker_eval_min=int(cfg.get("n_ranker_eval_min", 1000)),
+        n_ranker_eval_max=int(cfg.get("n_ranker_eval_max", 2000)),
+        n_ranker_eval_step=int(cfg.get("n_ranker_eval_step", 50)),
     )
 
 

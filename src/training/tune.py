@@ -441,9 +441,10 @@ def tune_ranker_and_n_cand_v2(
     baseline_params: dict | None = None,
     lgbm_scores_train: pl.DataFrame | None = None,
     lgbm_scores_eval: pl.DataFrame | None = None,
-    n_ranker_min: int = 400,
-    n_ranker_max: int = 1500,
-    n_ranker_step: int = 50,
+    n_ranker_train: int = 1023,
+    n_ranker_eval_min: int = 1000,
+    n_ranker_eval_max: int = 2000,
+    n_ranker_eval_step: int = 50,
 ) -> optuna.Study:
     """Anti-overfit variant of :func:`tune_ranker_and_n_cand`.
 
@@ -538,11 +539,16 @@ def tune_ranker_and_n_cand_v2(
             for name in cg_names
         }
         if cascade_enabled:
-            n_ranker = trial.suggest_int(
-                "n_ranker", n_ranker_min, n_ranker_max, step=n_ranker_step,
+            # Train cascade is fixed (1023 == GPU YetiRank cap), eval cascade
+            # is the optuna-tuned knob.
+            n_ranker_eval = trial.suggest_int(
+                "n_ranker_eval",
+                n_ranker_eval_min,
+                n_ranker_eval_max,
+                step=n_ranker_eval_step,
             )
         else:
-            n_ranker = None
+            n_ranker_eval = None
 
         # No budget penalty — RankerModel caps to 1023 rows/user on GPU.
         keep_expr = pl.lit(False)
@@ -564,8 +570,8 @@ def tune_ranker_and_n_cand_v2(
             return 0.0
 
         if cascade_enabled:
-            labeled_f = _cascade(labeled_f, lgbm_scores_train, n_ranker)
-            eval_f = _cascade(eval_f, lgbm_scores_eval, n_ranker)
+            labeled_f = _cascade(labeled_f, lgbm_scores_train, n_ranker_train)
+            eval_f = _cascade(eval_f, lgbm_scores_eval, n_ranker_eval)
 
         df_tr, df_va = _split_for_ranker(labeled_f, seed=seed)
         ranker = RankerModel(
@@ -627,12 +633,31 @@ def default_ranker_space(trial: optuna.Trial) -> dict:
     site (e.g. ``RankerModel(early_stopping_rounds=150, ...)``) to keep the
     Optuna search dimension lower. Past tuning showed best ES in 100-200
     range with little sensitivity, so fixing 150 is a safe default.
+
+    Two extra knobs vs the base 4-dim space:
+
+    * ``bagging_temperature`` (Bayesian bootstrap) — smooths the per-tree
+      sample weights of YetiRank's permutation grouping; default 1.0.
+      Sampling [0.0, 3.0] explores deterministic-bagging (0) through
+      strong-noise (3) regimes. Often gives +0.2-0.5 recall when 1.0 is
+      not optimal for the data.
+    * ``random_strength`` — random multiplier added to feature-split
+      gains; CatBoost docs §randomization. [0.5, 5.0] is the practical
+      band; 1.0 is the default.
+
+    These cost no compute; they only change which tree is grown.
     """
     return dict(
         iterations=trial.suggest_int("iterations", 1500, 4000, step=250),
         depth=trial.suggest_int("depth", 4, 8),
         learning_rate=trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
         l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
+        bagging_temperature=trial.suggest_float(
+            "bagging_temperature", 0.0, 3.0,
+        ),
+        random_strength=trial.suggest_float(
+            "random_strength", 0.5, 5.0, log=True,
+        ),
     )
 
 

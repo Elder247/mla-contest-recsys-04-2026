@@ -2,15 +2,16 @@
 the blended val/test recall.
 
 Pre-condition: ``train_ranker.py`` has already been run with the same
-config (``--config-name=ranker_v2_topX``) and ``run_id=base_run_id`` —
-this script reuses its cached labeled-train features, eval features, and
-ground-truth parquets. No CG re-fit, no feature recompute.
+config (``--config-name=ranker_v4_topX``) and ``run_id=base_run_id`` —
+this script reuses its cached labeled-train features, eval features,
+ground-truth parquets, **plus the LGBM stage-1 pickle and cached LGBM
+scores**. No CG re-fit, no feature recompute, no LGBM re-fit.
 
 Usage:
     python -u scripts/train_ranker_multiseed.py \\
-        --config-name=ranker_v2_top1 data=500m \\
-        run_id=v2_top1_ms \\
-        +base_run_id=v2_top1 \\
+        --config-name=ranker_v4_top1 data=500m \\
+        run_id=v4_top1_ms \\
+        +base_run_id=v4_top1 \\
         +seed_list=[42,43,44,45,46]
 
 Outputs:
@@ -22,6 +23,12 @@ mean-blends ``ranker_score`` on the full eval pool when generating a
 submission CSV. Splitting train and submit lets us run the cheap part
 (training) sequentially without re-doing the expensive full-data feature
 build for every config we test.
+
+Cascade behaviour mirrors ``train_ranker.py``: labeled features are
+cascaded to ``n_ranker_train`` (default 1023) per uid before all seeds
+share the same train/val split; eval features are cascaded to
+``n_ranker_eval`` for per-seed scoring. The same LGBM pickle is used by
+every seed (only the CatBoost stage-2 reseeds).
 """
 from __future__ import annotations
 
@@ -39,6 +46,7 @@ from sklearn.model_selection import GroupShuffleSplit
 
 from src.evaluation.metrics import recall_at_k
 from src.models.catboost_ranker import RankerModel
+from src.models.lightgbm_ranker import LightGBMRanker  # noqa: F401  (pickle compat)
 from src.utils import setup_logging
 
 log = logging.getLogger(__name__)
@@ -50,6 +58,20 @@ def _split_for_ranker(df: pl.DataFrame, seed: int) -> tuple[pl.DataFrame, pl.Dat
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
     train_idx, val_idx = next(gss.split(np.zeros(len(df)), groups=uids))
     return df[train_idx], df[val_idx]
+
+
+def _cascade_cut(df_feat: pl.DataFrame, df_lgbm: pl.DataFrame, n: int) -> pl.DataFrame:
+    """Apply the same LGBM-cascade cut used by ``train_ranker.py``."""
+    return (
+        df_feat
+        .join(df_lgbm, on=["uid", "item_id"], how="left")
+        .sort(["uid", "lgbm_score"], descending=[False, True])
+        .group_by("uid", maintain_order=True)
+        .head(n)
+        .with_columns(
+            pl.int_range(1, pl.len() + 1).over("uid").cast(pl.Int32).alias("lgbm_rank")
+        )
+    )
 
 
 def _append_results(path: Path, row: dict) -> None:
@@ -81,10 +103,20 @@ def main(cfg: DictConfig) -> None:
     features_dir = Path(cfg.features_dir)
     feats_train_path = features_dir / f"{base_run_id}_train.parquet"
     feats_eval_path = features_dir / f"{base_run_id}_eval.parquet"
+    lgbm_train_lgbm_path = features_dir / f"{base_run_id}_train_lgbm.parquet"
+    lgbm_eval_lgbm_path = features_dir / f"{base_run_id}_eval_lgbm.parquet"
+    ranker_dir = Path(cfg.ranker_dir)
+    base_lgbm_path = ranker_dir / f"lgbm_{base_run_id}.pkl"
     gt_dir = Path(cfg.gt_dir) / base_run_id
     gt_val_path = gt_dir / "gt_val.parquet"
     gt_test_path = gt_dir / "gt_test.parquet"
-    for p in (feats_train_path, feats_eval_path, gt_val_path, gt_test_path):
+    required = [
+        feats_train_path, feats_eval_path,
+        lgbm_train_lgbm_path, lgbm_eval_lgbm_path,
+        base_lgbm_path,
+        gt_val_path, gt_test_path,
+    ]
+    for p in required:
         if not p.exists():
             raise FileNotFoundError(
                 f"missing prerequisite: {p}\n"
@@ -99,6 +131,28 @@ def main(cfg: DictConfig) -> None:
     feats_eval = pl.read_parquet(feats_eval_path)
     log.info("eval features: %d rows × %d cols", len(feats_eval), len(feats_eval.columns))
 
+    log.info(
+        "loading cached LGBM scores ← train=%s  eval=%s",
+        lgbm_train_lgbm_path, lgbm_eval_lgbm_path,
+    )
+    labeled_lgbm = pl.read_parquet(lgbm_train_lgbm_path)
+    eval_lgbm = pl.read_parquet(lgbm_eval_lgbm_path)
+
+    # ── Cascade cuts (mirror train_ranker.py) ────────────────────────────────
+    n_ranker_train = int(cfg.get("n_ranker_train", 1023))
+    n_ranker_eval = int(cfg.get("n_ranker_eval", 1500))
+    log.info(
+        "cascade: train top-%d / eval top-%d per user",
+        n_ranker_train, n_ranker_eval,
+    )
+    labeled = _cascade_cut(labeled, labeled_lgbm, n_ranker_train)
+    feats_eval = _cascade_cut(feats_eval, eval_lgbm, n_ranker_eval)
+    log.info(
+        "after cascade: labeled=%d rows, eval=%d rows",
+        len(labeled), len(feats_eval),
+    )
+    del labeled_lgbm, eval_lgbm
+
     gt_val = pl.read_parquet(gt_val_path)
     gt_test = pl.read_parquet(gt_test_path)
     log.info(
@@ -112,7 +166,6 @@ def main(cfg: DictConfig) -> None:
     log.info("ranker train=%d  val=%d", len(df_train), len(df_val))
     del labeled
 
-    ranker_dir = Path(cfg.ranker_dir)
     ranker_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-seed scoring on eval features (collect into one DF for blend).

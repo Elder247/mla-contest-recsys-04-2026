@@ -163,22 +163,22 @@ def main(cfg: DictConfig) -> None:
         len(feats), len(feats.columns),
     )
 
-    # Cascade stage-1: LGBM scores → top-n_ranker per user, append lgbm_rank.
+    # Cascade stage-1: LGBM scores → top-n_ranker_eval per user, append lgbm_rank.
     log.info("LGBM stage-1 scoring on %d submission rows", len(feats))
     lgbm_scores = lgbm.score(feats)
-    n_ranker = int(cfg.get("n_ranker", 1500))
+    n_ranker_eval = int(cfg.get("n_ranker_eval", cfg.get("n_ranker", 1500)))
     feats_cut = (
         feats.join(lgbm_scores, on=["uid", "item_id"], how="left")
         .sort(["uid", "lgbm_score"], descending=[False, True])
         .group_by("uid", maintain_order=True)
-        .head(n_ranker)
+        .head(n_ranker_eval)
         .with_columns(
             pl.int_range(1, pl.len() + 1).over("uid").cast(pl.Int32).alias("lgbm_rank")
         )
     )
     log.info(
         "cascade: %d → %d rows after top-%d cut",
-        len(feats), len(feats_cut), n_ranker,
+        len(feats), len(feats_cut), n_ranker_eval,
     )
     del feats, lgbm_scores
 
