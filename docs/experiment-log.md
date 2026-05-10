@@ -52,4 +52,7 @@
 | - | blending | - | - | - | **326.03** | sub_blend_ms_v2t1_w5545 - sub_v4_top1_ms:0.55, sub_v2_top1:0.50 |
 | - | blending | - | - | - | **326.34** | sub_blend_ms_v2t1_w5248_k45 - sub_v4_top1_ms:0.52, sub_v2_top1:0.48, rrf=45 |
 | - | blending | - | - | - | **326.26** | sub_blend_ms_v2t1_w5248_k70 - sub_v4_top1_ms:0.52, sub_v2_top1:0.48, rrf=70 |
-| - | blending | - | - | - | **327.00** | sub_blend_meta_best2 - sub_blend_ms_v2t1:0.52, sub_blend_ms_v2t5:0.48 |
+| - | blending | - | - | - | **326.71** | sub_blend_meta_best2_w5446 - sub_blend_ms_v2t1:0.54, sub_blend_ms_v2t5:0.46 |
+| - | blending | - | - | - | **327.00** | sub_blend_meta_best2_w5248 - sub_blend_ms_v2t1:0.52, sub_blend_ms_v2t5:0.48 |
+| - | blending | - | - | - | **327.04** | sub_blend_meta_best2_w5050 - sub_blend_ms_v2t1:0.50, sub_blend_ms_v2t5:0.50 |
+| - | blending | - | - | - | **326.79** | sub_blend_meta_best2_w4852 - sub_blend_ms_v2t1:0.48, sub_blend_ms_v2t5:0.52 |
