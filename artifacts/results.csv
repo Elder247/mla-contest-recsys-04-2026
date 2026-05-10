@@ -55,3 +55,15 @@ run_id,model,dataset_size,split,score,config_path
 20260508_013758,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,395.6064,configs/ranker.yaml
 20260509_114302,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,392.6917,configs/ranker.yaml
 20260509_114302,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,387.1602,configs/ranker.yaml
+20260509_205556,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,403.5537,configs/ranker.yaml
+20260509_205556,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,397.5052,configs/ranker.yaml
+20260509_212617,"ranker_refit[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,516.2473,configs/ranker.yaml
+20260509_212617,"ranker_refit[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,490.6545,configs/ranker.yaml
+20260510_001305,"ranker_refit[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,512.9417,configs/ranker.yaml
+20260510_001305,"ranker_refit[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,487.7159,configs/ranker.yaml
+20260510_111952,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,499.4992,configs/ranker.yaml
+20260510_111952,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,477.5332,configs/ranker.yaml
+20260510_180100,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,466.6757,configs/ranker.yaml
+20260510_180100,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,449.3412,configs/ranker.yaml
+20260510_185626,"ranker_multiseed_5seeds[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,499.2389,configs/ranker.yaml
+20260510_185626,"ranker_multiseed_5seeds[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,477.5324,configs/ranker.yaml
