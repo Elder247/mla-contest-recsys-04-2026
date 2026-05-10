@@ -38,11 +38,18 @@
 | 20260510_111952 | joint_v4 | 500m | 499.4992 | 477.5332 | **320.4** | sub_v4_top1_v4_top1 |
 | 20260510_180100 | joint_v4 | 500m | 466.6757 | 449.3412 | **319.7** | sub_v4_top2_cpu - n_ranker_train=1500 and n_ranker_eval=1500 |
 | 20260510_185626 | joint_v4 | 500m | 499.2389 | 477.5324 | **320.68** | sub_v4_top1_ms_v4_top1_ms.csv - multiseed with top1 optuna |
-| 20260510_221200 | blending | 500m | - | - | **326.27** | sub_blend_ms_v2t5 - sub_v4_top1_ms_v4_top1_ms.csv:0.52, sub_v2_top5_v2_top5.csv:0.48 |
-| 20260510_221200 | blending | 500m | - | - | **325.35** | sub_blend_ms_v2t5_005 - sub_v4_top1_ms_v4_top1_ms.csv:0.40, sub_v2_top5_v2_top5.csv:0.35, sub_server_005_ranker.csv:0.25 |
-| 20260510_221200 | blending | 500m | - | - | **326.33** | sub_blend_ms_v2t1 - sub_v4_top1_ms_v4_top1_ms.csv:0.52, submissions/sub_v2_top1_v2_top1.csv:0.48 |
-| 20260510_221200 | blending | 500m | - | - | 321.80 | sub_blend_v4t1_v4t2cpu - sub_v4_top1_v4_top1.csv:0.52, sub_v4_top2_cpu_v4_top1.csv:0.48 |
-| 20260510_221200 | blending | 500m | - | - | **325.48** | sub_blend_v4t1_v2t5_005 - sub_v4_top1_v4_top1.csv:0.42, sub_v2_top5_v2_top5.csv:0.35, sub_server_005_ranker.csv:0.23 |
-| 20260510_221200 | blending | 500m | - | - | **326.01** | sub_blend_ms_v2t5_v2t1_005 - sub_v4_top1_ms_v4_top1_ms.csv:0.35, sub_v2_top5_v2_top5.csv:0.28, sub_v2_top1_v2_top1.csv:0.22, sub_server_005_ranker.csv:0.15 |
-| 20260510_221200 | blending | 500m | - | - | 324.68 | sub_blend_ms_oldtriple - sub_v4_top1_ms_v4_top1_ms.csv:0.45, sub_blend_005_004_003.csv:0.55 |
-| 20260510_221200 | blending | 500m | - | - | **326.31** | sub_blend_ms_v2t5_k45 - rrf-k=45, sub_v4_top1_ms_v4_top1_ms.csv:0.52, sub_v2_top5_v2_top5.csv:0.48 |
+| - | blending | 500m | - | - | **326.27** | sub_blend_ms_v2t5 - sub_v4_top1_ms_v4_top1_ms.csv:0.52, sub_v2_top5_v2_top5.csv:0.48 |
+| - | blending | 500m | - | - | **325.35** | sub_blend_ms_v2t5_005 - sub_v4_top1_ms_v4_top1_ms.csv:0.40, sub_v2_top5_v2_top5.csv:0.35, sub_server_005_ranker.csv:0.25 |
+| - | blending | 500m | - | - | **321.80** | sub_blend_v4t1_v4t2cpu - sub_v4_top1_v4_top1.csv:0.52, sub_v4_top2_cpu_v4_top1.csv:0.48 |
+| - | blending | 500m | - | - | **325.48** | sub_blend_v4t1_v2t5_005 - sub_v4_top1_v4_top1.csv:0.42, sub_v2_top5_v2_top5.csv:0.35, sub_server_005_ranker.csv:0.23 |
+| - | blending | 500m | - | - | **326.01** | sub_blend_ms_v2t5_v2t1_005 - sub_v4_top1_ms_v4_top1_ms.csv:0.35, sub_v2_top5_v2_top5.csv:0.28, sub_v2_top1_v2_top1.csv:0.22, sub_server_005_ranker.csv:0.15 |
+| - | blending | 500m | - | - | **324.68** | sub_blend_ms_oldtriple - sub_v4_top1_ms_v4_top1_ms.csv:0.45, sub_blend_005_004_003.csv:0.55 |
+| - | blending | 500m | - | - | **326.31** | sub_blend_ms_v2t5_k45 - rrf-k=45, sub_v4_top1_ms_v4_top1_ms.csv:0.52, sub_v2_top5_v2_top5.csv:0.48 |
+| - | blending | 500m | - | - | **326.33** | sub_blend_ms_v2t1 - sub_v4_top1_ms:0.52, sub_v2_top1:0.48 |
+| - | blending | - | - | - | **326.04** | sub_blend_ms_v2t1_w5050 - sub_v4_top1_ms:0.50, sub_v2_top1:0.50 |
+| - | blending | - | - | - | **326.12** | sub_blend_ms_v2t1_w5149 - sub_v4_top1_ms:0.51, sub_v2_top1:0.50 |
+| - | blending | - | - | - | **326.29** | sub_blend_ms_v2t1_w5347 - sub_v4_top1_ms:0.53, sub_v2_top1:0.50 |
+| - | blending | - | - | - | **326.03** | sub_blend_ms_v2t1_w5545 - sub_v4_top1_ms:0.55, sub_v2_top1:0.50 |
+| - | blending | - | - | - | **326.34** | sub_blend_ms_v2t1_w5248_k45 - sub_v4_top1_ms:0.52, sub_v2_top1:0.48, rrf=45 |
+| - | blending | - | - | - | **326.26** | sub_blend_ms_v2t1_w5248_k70 - sub_v4_top1_ms:0.52, sub_v2_top1:0.48, rrf=70 |
+| - | blending | - | - | - | **327.00** | sub_blend_meta_best2 - sub_blend_ms_v2t1:0.52, sub_blend_ms_v2t5:0.48 |
