@@ -1,0 +1,39 @@
+{
+  "study_name": "joint_v4",
+  "best_value": 500.5406901535704,
+  "best_params": {
+    "iterations": 2250,
+    "depth": 6,
+    "learning_rate": 0.02045273156720127,
+    "l2_leaf_reg": 3.649743979472391,
+    "bagging_temperature": 1.1069929911000256,
+    "random_strength": 1.6613914756747772,
+    "n_cand_decaypop": 525,
+    "n_cand_als": 625,
+    "n_cand_repeat": 800,
+    "n_cand_itemknn": 750,
+    "n_cand_artist_pop": 800,
+    "n_cand_album_pop": 675,
+    "n_cand_recent_likes": 625,
+    "n_cand_audio_knn": 800,
+    "n_cand_esasrec": 800,
+    "n_ranker_eval": 1200
+  },
+  "n_trials": 100,
+  "phase": "joint_v2",
+  "n_max_per_cg": 800,
+  "n_cand_min": 0,
+  "combined_objective": true,
+  "cg_names": [
+    "decaypop",
+    "als",
+    "repeat",
+    "itemknn",
+    "artist_pop",
+    "album_pop",
+    "recent_likes",
+    "audio_knn",
+    "esasrec"
+  ],
+  "early_stopping_rounds": 150
+}
