@@ -1,171 +1,175 @@
-# Yandex Music RecSys contest — Моя Волна
+# RecSys — Моя Волна
 
-Two-stage candidate generation + CatBoost YetiRank reranker for Yandex Music's
-"My Wave" recommendation contest. Predicts up to 100 tracks per user from a
-10 000-user evaluation set; metric is `Recall@100 × 1000`.
+Внутренний контест Яндекса: **candidate generation** — до 100 `item_id` на пользователя. Оценка только на 10k uid из `submissions/users.csv`. Метрика: `Recall@100 × 1000`. Формат сабмита: `uid,item_ids`.
 
-Architecture, hygiene, and current CG bank are documented in
-[CLAUDE.md](CLAUDE.md). Detailed roadmap and per-run history live in
-[docs/roadmap.md](docs/roadmap.md) and [docs/experiment-log.md](docs/experiment-log.md).
+Архитектура: 9 CG → merge → фичи → LightGBM (top-1023) → CatBoost YetiRank (top-100).
+Подробнее — [CLAUDE.md](CLAUDE.md).
 
 ---
 
-## Quickstart (server, fresh clone)
+## Структура
 
-Assumes Linux + NVIDIA GPU. Adjust the `data.root` / `artifacts_root` paths to
-your persistent disk if applicable (e.g. `~/dc-remote/...`).
+| Путь | Назначение |
+|------|------------|
+| `configs/` | Hydra: `data/{50m,500m}.yaml`, `model/*.yaml`, `ranker.yaml`, `tune.yaml`, `submit_ranker.yaml`, оверлеи `ranker_v4_top{1..5}.yaml` из Optuna |
+| `src/` | Данные, модели CG, фичи, merge, метрики, фазы пайплайна |
+| `scripts/` | Точки входа: `train_ranker`, `submit_ranker`, `tune`, `refit_ranker`, multiseed, `blend_submissions`, `apply_optuna_top_k`, `train`/`evaluate` (один CG), `fit_cg_full`, `download_data`, `validate_submission`, `inspect_run` |
+| `tests/` | pytest |
+| `docs/` | `experiment-log.md`, прочие заметки |
+| `submissions/` | `users.csv`, `sub_*.csv` |
+| `data/` | Parquet датасета (gitignore) |
+| `artifacts/` | CG/ranker pickle, `features/*.parquet`, `optuna/*.db`, `results.csv` (gitignore; путь задаётся `artifacts_root`) |
 
-Clone
+---
+
+## Окружение
+
 ```bash
-git clone https://github.com/Elder247/mla-contest-recsys-04-2026 mla_contest && cd mla_contest
-```
+git clone https://github.com/Elder247/mla-contest-recsys-04-2026.git
+cd mla-contest-recsys-04-2026
 
-Python env (3.11 or 3.12)
-```bash
-python3.12 -m venv .venv && source .venv/bin/activate
+python3.10 -m venv .venv
+source .venv/bin/activate
 export PYTHONPATH=$(pwd)
 ```
 
-Install. CUDA torch first, then the rest:
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.0
 pip install -r requirements.txt
 ```
 
-Download 50m data to persistent disk
+**Данные** (Hugging Face `yandex/yambda`), `model=pop` нужен Hydra для конфига `train`:
+
 ```bash
-mkdir -p ~/dc-remote/{data,artifacts}
-python3 -u scripts/download_data.py data=50m data.root=/home/astrofimuk/dc-remote/data model=pop
+python -u scripts/download_data.py data=50m model=pop data.root=/ABS/PATH/data
+# 500m: data=500m
+# 5b: data=5b
 ```
 
-Verify the install
+Опции для переопределения путей при запусках (если нужны не дефолтные значения из `configs/data/*.yaml` и `ranker.yaml`):
+
 ```bash
-python3 -m pytest tests/ -v
-```
-
-Baseline on 50m (CPU)
-```bash
-python -u scripts/train_ranker.py data=50m run_id=server_001 \
-    data.root=/home/astrofimuk/dc-remote/data \
-    artifacts_root=/home/astrofimuk/dc-remote/artifacts \
-    cache_features=true 2>&1 | tee /tmp/run.log
-```
-
-Baseline on 50m (GPU)
-```bash
-python -u scripts/train_ranker.py data=50m run_id=server_001_gpu \
-    data.root=/home/astrofimuk/dc-remote/data \
-    artifacts_root=/home/astrofimuk/dc-remote/artifacts \
-    ranker.task_type=GPU ranker.devices='0' \
-    cache_features=true 2>&1 | tee /tmp/run_gpu.log
-```
-
-Build the submission CSV
-```bash
-python -u scripts/submit_ranker.py \
-    data=50m run_id=server_001_gpu \
-    data.root=/home/astrofimuk/dc-remote/data \
-    artifacts_root=/home/astrofimuk/dc-remote/artifacts \
-    submission_name=server_gpu_baseline
-```
-
-Validate the CSV format before uploading (optional)
-```bash
-python scripts/validate_submission.py submissions/sub_server_001_*.csv
-```
-
-Local development on a Mac follows the same flow with the defaults — no
-need for the `data.root` / `artifacts_root` overrides; data lives in
-`./data`, artifacts in `./artifacts`. CPU torch is fine; faiss-cpu is the
-default on Apple Silicon.
-
-
-## Layout
-
-```
-configs/      Hydra configs (data, model, ranker, tune, submit_ranker)
-src/          Library code: data loaders, models, features, evaluation,
-              inference, training utilities
-scripts/      Hydra entrypoints (train_ranker, submit_ranker, tune, ...)
-              + plain CLIs (validate_submission, inspect_run)
-tests/        pytest suite
-docs/         Roadmap, dataset / data dictionary, experiment log
-submissions/  Output CSVs (sub_*.csv) and the eval users list
-artifacts/    CG / ranker pickles, feature_importance, results.csv,
-              optuna sqlite — redirect via ``artifacts_root=...``
-data/         Yambda parquets (gitignored) — redirect via ``data.root=...``
+data.root=/ABS/PATH/data artifacts_root=/ABS/PATH/artifacts
 ```
 
 ---
 
-## Common commands
+## Тесты
 
 ```bash
-# Standalone CG (debug only — main entrypoint is train_ranker.py)
-python -u scripts/train.py model=als data=50m
-python -u scripts/evaluate.py model=als data=50m
-
-# Multi-CG → ranker pipeline (main)
-python -u scripts/train_ranker.py data=50m run_id=NNN
-python -u scripts/submit_ranker.py data=50m run_id=NNN submission_name=NAME
-
-# Force-refit all CGs (ignore pickle cache)
-python -u scripts/train_ranker.py data=50m run_id=NNN force_refit_cg=true
-
-# Optuna tuning (3 phases)
-python -u scripts/tune.py phase=cg cg_name=als n_trials=50 n_max=500
-python -u scripts/tune.py phase=ranker n_trials=30 run_id=NNN
-python -u scripts/tune.py phase=n_cand n_trials=50 run_id=NNN total_budget=1500
-
-# Diagnostics
-python scripts/inspect_run.py NNN [--top 15]
-python scripts/validate_submission.py submissions/sub_NNN_*.csv
-
-# Tests
 pytest tests/ -v
 ```
 
-See [CLAUDE.md](CLAUDE.md) for code style, hygiene rules
-(`temporal_split` invariants, CG cache semantics), and coding conventions
-followed by both human contributors and AI agents.
+---
 
+## Один CG (train на сплите / full pickle для submit)
 
-# Optuna joint configs
-1. Сгенерить 5 конфигов из топа joint_v2
 ```bash
-python scripts/apply_optuna_top_k.py \
-  --study-name joint_v2 \
-  --storage sqlite:///${HOME}/dc-remote/artifacts/optuna/joint_v3.db \
-  --base configs/ranker.yaml \
-  --out-prefix configs/ranker_v3_top \
-  --top-k 1
+python -u scripts/train.py model=als data=50m
+python -u scripts/evaluate.py model=als data=50m
+# полный датасет → artifacts/cg/{name}_{size}_full.pkl (submit_ranker)
+python -u scripts/fit_cg_full.py model=esasrec data=500m
 ```
 
-2. Прогон train+submit для каждого
+---
+
+## Финальный пайплайн (500m, joint_v4)
+
+Имена `run_id`/`submission_name` — примеры
+
+**1. Один раз:** фичи + LGBM-кэш скоров (в `ranker.yaml` проставить везде `n_cand` = `n_max_per_cg` из следующего шага, например, 800):
+
 ```bash
-for i in 1 2 3 4 5; do \
-  set -o pipefail && \
-  python -u scripts/train_ranker.py \
-    --config-name=ranker_v2_top$i \
-    data=500m run_id=v2_top$i \
-    2>&1 | tee /tmp/v2_top${i}_train.log && \
-  python -u scripts/submit_ranker.py \
-    --config-name=ranker_v2_top$i \
-    data=500m run_id=v2_top$i \
-    +submission_dir=submissions \
-    +submission_name=v2_top$i \
-    2>&1 | tee /tmp/v2_top${i}_submit_v2.log; \
-done
+python -u scripts/train_ranker.py data=500m run_id=v4_features \
+  feature_chunk_size=5000 enable_embed_features=true \
+  2>&1 | tee /tmp/v4_features.log
 ```
-3. Или прогон только submit обученных ранкеров
+
+**2. Optuna** (`phase=joint_v2`, имя стади `joint_v4`; 9 CG, включая `esasrec`; `n_max_per_cg` = `n_cand` при построении фич, здесь 800):
+
 ```bash
-for i in 1 2 3 4 5; do \
-  set -o pipefail && \
-  python -u scripts/submit_ranker.py \
-    --config-name=ranker_v2_top$i \
-    data=500m run_id=v2_top$i \
-    +submission_dir=submissions \
-    +submission_name=v2_top$i \
-    2>&1 | tee /tmp/v2_top${i}_submit_v2.log; \
-done
+python -u scripts/tune.py phase=joint_v2 data=500m run_id=v4_features \
+  n_max_per_cg=800 n_cand_min=0 \
+  cg_names_list='[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]' \
+  study_name=joint_v4 n_trials=80 \
+  2>&1 | tee /tmp/joint_v4.log
+```
+
+**3. Создать YAML конфиги для Top-k запусков из optuna:
+
+```bash
+python scripts/apply_optuna_top_k.py --study-name joint_v4 \
+  --storage sqlite:////ABS/artifacts/optuna/joint_v4.db \
+  --base configs/ranker.yaml --out-prefix configs/ranker_v4_top --top-k 5 \
+  --pool-size 800
+```
+
+**4. Обучение + сабмит**:
+
+```bash
+python -u scripts/train_ranker.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1 feature_chunk_size=5000 \
+  2>&1 | tee /tmp/v4_top1_train.log
+
+python -u scripts/submit_ranker.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1 submission_name=v4_top1 \
+  2>&1 | tee /tmp/v4_top1_submit.log
+```
+
+**5. Проверка**
+
+```bash
+python scripts/validate_submission.py submissions/sub_v4_top1_v4_top1.csv
+python scripts/inspect_run.py v4_top1
+```
+
+**6. Multiseed CatBoost** (те же фичи/LGBM, другой `run_id`, `+base_run_id` на кэш шага 4):
+
+```bash
+python -u scripts/train_ranker_multiseed.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1_ms +base_run_id=v4_top1 \
+  +seed_list=[42,43,44,45,46] \
+  2>&1 | tee /tmp/v4_top1_ms_train.log
+
+python -u scripts/submit_ranker_multiseed.py --config-name=ranker_v4_top1 \
+  data=500m run_id=v4_top1_ms +base_run_id=v4_top1 \
+  +seed_list=[42,43,44,45,46] submission_name=v4_top1_ms \
+  2>&1 | tee /tmp/v4_top1_ms_submit.log
+```
+
+**7. Переобучить только LGBM+CatBoost** без пересчёта фич: [scripts/refit_ranker.py](scripts/refit_ranker.py) — те же `data`, `run_id`, при оверлее `--config-name=ranker_v4_top1`.
+
+```bash
+python -u scripts/refit_ranker.py --config-name=ranker_v4_top1 \\
+    data=500m run_id=v4_top1
+```
+
+**8. Весовой / RRF блендинг CSV**
+Со стандартным rrf-k=60:
+```bash
+python -u scripts/blend_submissions.py \
+  --inputs submissions/sub_v4_top1_ms_v4_top1_ms.csv:0.52 submissions/sub_v2_top1_v2_top1.csv:0.48 \
+  --output submissions/sub_blend_ms_v2t1.csv
+python scripts/validate_submission.py submissions/sub_blend_ms_v2t1.csv
+```
+
+rrf-k=45:
+```bash
+.venv/bin/python -u scripts/blend_submissions.py --rrf-k 45 \
+  --inputs submissions/sub_v4_top1_ms_v4_top1_ms.csv:0.52 submissions/sub_v2_top1_v2_top1.csv:0.48 \
+  --output submissions/sub_blend_ms_v2t1_k45.csv
+```
+
+---
+
+## Остальные команды
+
+```bash
+python -u scripts/tune.py phase=cg cg_name=als n_trials=20 data=50m
+python -u scripts/tune.py phase=ranker n_trials=25 run_id=RUN data=500m  # deprecated
+python -u scripts/tune.py phase=n_cand n_trials=15 run_id=RUN data=500m  # deprecated
+```
+
+```bash
+python -u scripts/train_ranker.py data=500m run_id=RUN force_refit_cg=true
 ```
