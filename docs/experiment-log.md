@@ -56,3 +56,7 @@
 | - | blending | - | - | - | **327.00** | sub_blend_meta_best2_w5248 - sub_blend_ms_v2t1:0.52, sub_blend_ms_v2t5:0.48 |
 | - | blending | - | - | - | **327.04** | sub_blend_meta_best2_w5050 - sub_blend_ms_v2t1:0.50, sub_blend_ms_v2t5:0.50 |
 | - | blending | - | - | - | **326.79** | sub_blend_meta_best2_w4852 - sub_blend_ms_v2t1:0.48, sub_blend_ms_v2t5:0.52 |
+| - | joint_v4 | - | 512.93 | 487.87 | **318.96**| sub_v4_top2 |
+| - | joint_v4 | - | 512.85 | 487.94 | **318.91** | sub_v4_top3 |
+| - | joint_v4 | - | 512.47 | 488.00 | **319.07** | sub_v4_top4 |
+| - | joint_v4 | - | 512.54 | 487.90 | **318.98** | sub_v4_top5 |
