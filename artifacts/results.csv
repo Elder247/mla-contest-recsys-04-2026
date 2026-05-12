@@ -67,3 +67,11 @@ run_id,model,dataset_size,split,score,config_path
 20260510_180100,"ranker[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,449.3412,configs/ranker.yaml
 20260510_185626,"ranker_multiseed_5seeds[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,499.2389,configs/ranker.yaml
 20260510_185626,"ranker_multiseed_5seeds[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,477.5324,configs/ranker.yaml
+20260510_224310,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,512.9255,configs/ranker.yaml
+20260510_224310,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,487.8727,configs/ranker.yaml
+20260510_224858,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,512.8475,configs/ranker.yaml
+20260510_224858,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,487.9416,configs/ranker.yaml
+20260510_225141,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,512.4709,configs/ranker.yaml
+20260510_225141,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,487.9972,configs/ranker.yaml
+20260510_225429,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,val,512.5431,configs/ranker.yaml
+20260510_225429,"ranker_topk[decaypop,als,repeat,itemknn,artist_pop,album_pop,recent_likes,audio_knn,esasrec]",500m,test,487.9022,configs/ranker.yaml
